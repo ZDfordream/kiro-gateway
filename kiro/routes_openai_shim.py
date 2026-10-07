@@ -747,6 +747,16 @@ async def _stream_response(
 #   * `store` — accepted as a no-op: responses are never persisted (there is no
 #     retrieval endpoint), so a request setting it validates and succeeds, but
 #     the response cannot later be fetched or chained by id.
+#
+# Codex compatibility (upstream issue #247, verified with live Codex 0.160):
+#   * Every input item is carried: `developer`/`system` roles are preserved,
+#     `reasoning` items render as `[reasoning]` context, and `*_call` /
+#     `*_call_output` items render as the shared `[tool_use]`/`[tool_result]`
+#     markers (issue #43).
+#   * Surfaced kiro-cli tool calls (`ACP_SURFACE_TOOL_CALLS=true`) get a
+#     `kiro_`-prefixed `call_id`. A follow-up that only returns outputs for
+#     those already-executed calls is completed without a new ACP turn, which
+#     ends the client's tool loop (`_is_executed_tool_echo`).
 # ===========================================================================
 
 class OAIResponsesRequest(BaseModel):
@@ -786,17 +796,260 @@ class OAIResponsesRequest(BaseModel):
     mcp_servers: Optional[list[dict]] = None
 
 
+# Prefix marking the ``call_id`` of every kiro-cli built-in tool call the
+# Responses route surfaces as a ``function_call`` item
+# (``ACP_SURFACE_TOOL_CALLS=true``). Those calls were already executed by
+# kiro-cli inside the turn, but the Responses API has no ``finish_reason``: a
+# client such as Codex treats *any* ``function_call`` output item as pending,
+# runs (or refuses) it, and posts a ``function_call_output`` back. Verified
+# against live Codex 0.160 + kiro-cli 2.28.0: without a guard this looped until
+# the client was killed, with each round costing credits for a new kiro-cli turn.
+# The marker lets the gateway recognise those echoes without any server-side
+# state (see :func:`_is_executed_tool_echo`).
+_KIRO_CALL_ID_PREFIX = "kiro_"
+
+# Message roles preserved verbatim from Responses input items; any other role
+# is carried as user content.
+_RESPONSES_INPUT_ROLES = ("user", "assistant", "system", "developer")
+
+
+def _responses_call_id(tool_call_id: str | None) -> str:
+    """Return the marked Responses ``call_id`` for a kiro-cli tool call.
+
+    Args:
+        tool_call_id: The ACP tool-call id (may be empty or already marked).
+
+    Returns:
+        The id prefixed with :data:`_KIRO_CALL_ID_PREFIX` (idempotent; a fresh
+        id is generated when *tool_call_id* is empty).
+    """
+    raw = str(tool_call_id or "") or f"call_{uuid.uuid4().hex[:24]}"
+    if raw.startswith(_KIRO_CALL_ID_PREFIX):
+        return raw
+    return f"{_KIRO_CALL_ID_PREFIX}{raw}"
+
+
+def _is_executed_tool_echo(input_value: Any) -> bool:
+    """Detect a follow-up request that only echoes already-executed tool calls.
+
+    After a response that carried surfaced kiro-cli tool calls, a Responses
+    client sends the conversation back with a ``*_call_output`` for each call.
+    When every output after the last ``user``/``developer``/``system`` message
+    belongs to a gateway-marked call (:func:`_responses_call_id`), there is no
+    new input: kiro-cli already ran those tools and finished the turn. The
+    route then completes the response without opening a new ACP turn, which
+    ends the client's tool loop.
+
+    Args:
+        input_value: The Responses ``input`` field.
+
+    Returns:
+        ``True`` only when the trailing segment holds at least one tool output
+        and all of them reference gateway-marked call ids.
+    """
+    if not isinstance(input_value, list):
+        return False
+    boundary = -1
+    for index, item in enumerate(input_value):
+        if not isinstance(item, dict):
+            boundary = index
+            continue
+        is_message = item.get("type") in (None, "message")
+        if is_message and item.get("role", "user") in ("user", "system", "developer"):
+            boundary = index
+    output_ids = [
+        str(item.get("call_id") or item.get("id") or "")
+        for item in input_value[boundary + 1:]
+        if isinstance(item, dict) and str(item.get("type") or "").endswith("_call_output")
+    ]
+    return bool(output_ids) and all(
+        call_id.startswith(_KIRO_CALL_ID_PREFIX) for call_id in output_ids
+    )
+
+
+def _responses_content_to_acp(content: Any) -> Any:
+    """Normalise a Responses message content / tool output to ACP content.
+
+    Args:
+        content: A string, a list of content parts (``input_text`` /
+            ``output_text`` / ``input_image`` / ``input_file`` / …), a JSON
+            object, or ``None``.
+
+    Returns:
+        A string, or a block list when an image is present (see
+        :func:`kiro.multimodal.collapse_blocks`). ``None`` becomes ``""``.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # input_image is forwarded as an ACP image block, input_file/document is
+        # extracted or placeholdered, input_audio is placeholdered (issue #33).
+        blocks: list[dict] = []
+        for part in content:
+            blocks.extend(openai_part_to_blocks(part))
+        return collapse_blocks(blocks)
+    if isinstance(content, dict):
+        return json.dumps(content)
+    return str(content)
+
+
+def _is_empty_content(content: Any) -> bool:
+    """Return ``True`` for content that would render as an empty turn."""
+    if isinstance(content, str):
+        return not content.strip()
+    return not content
+
+
+def _responses_reasoning_text(item: dict) -> str:
+    """Extract the readable text of a Responses ``reasoning`` input item.
+
+    Prefers the ``summary`` parts and falls back to raw ``content`` reasoning
+    text. Opaque ``encrypted_content`` is never decoded (kiro-cli could not use
+    it), so an item carrying only that yields ``""``.
+
+    Args:
+        item: A ``{"type": "reasoning", ...}`` input item.
+
+    Returns:
+        The joined reasoning text, or ``""`` when there is none.
+    """
+    for key in ("summary", "content"):
+        parts = item.get(key)
+        if not isinstance(parts, list):
+            continue
+        texts = [
+            part["text"] for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+            and part["text"].strip()
+        ]
+        if texts:
+            return "\n".join(texts)
+    return ""
+
+
+def _responses_tool_item_to_acp(item: dict, item_type: str) -> list[PromptMessage]:
+    """Render a Responses tool-call / tool-output item as transcript markers.
+
+    Uses the same ``[tool_use id=… name=…]`` / ``[tool_result id=…]`` markers as
+    the Chat Completions and Anthropic shims (issue #43), so a prior tool turn
+    is carried in the history instead of being dropped. Covers
+    ``function_call``, ``custom_tool_call`` (Codex's freeform ``apply_patch``),
+    ``local_shell_call``, hosted calls such as ``mcp_call`` /
+    ``web_search_call``, and every matching ``*_call_output``.
+
+    Args:
+        item: The input item.
+        item_type: Its ``type`` (ends with ``_call`` or ``_call_output``).
+
+    Returns:
+        The rendered messages: an ``assistant`` tool-use turn and/or a ``user``
+        tool-result turn.
+    """
+    call_id = item.get("call_id") or item.get("id") or ""
+    if item_type.endswith("_call_output"):
+        output = _responses_content_to_acp(item.get("output"))
+        return [PromptMessage(
+            role="user", content=prepend_text(output, f"[tool_result id={call_id}]"),
+        )]
+
+    name = item.get("name") or item_type[: -len("_call")]
+    if item.get("server_label"):
+        name = f"{item['server_label']}/{name}"
+    arguments: Any = ""
+    for key in ("arguments", "input", "action", "queries", "code"):
+        if item.get(key) is not None:
+            arguments = item[key]
+            break
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments)
+    rendered = [PromptMessage(
+        role="assistant", content=f"[tool_use id={call_id} name={name}]\n{arguments}",
+    )]
+    # Hosted calls (e.g. mcp_call) carry their result on the same item.
+    inline_output = item.get("output")
+    if inline_output is not None and not _is_empty_content(inline_output):
+        rendered.append(PromptMessage(
+            role="user",
+            content=prepend_text(
+                _responses_content_to_acp(inline_output), f"[tool_result id={call_id}]",
+            ),
+        ))
+    return rendered
+
+
+def _responses_item_to_acp(item: Any) -> list[PromptMessage]:
+    """Convert one Responses ``input`` item to zero or more ACP messages.
+
+    Args:
+        item: A message item (``{"role", "content"}``, ``type`` optional), a
+            ``reasoning`` item, a tool call / tool output item, or a bare value.
+
+    Returns:
+        The rendered messages; empty for items with no carriable content
+        (e.g. a reasoning item holding only ``encrypted_content``).
+    """
+    if not isinstance(item, dict):
+        return [PromptMessage(role="user", content=str(item))]
+
+    item_type = str(item.get("type") or "")
+
+    if item_type in ("", "message"):
+        role = item.get("role", "user")
+        if role not in _RESPONSES_INPUT_ROLES:
+            role = "user"
+        content = _responses_content_to_acp(item.get("content"))
+        if role in ("system", "developer") and isinstance(content, str) \
+                and settings.SANITIZE_SYSTEM_PROMPTS:
+            # Same identity/concealment filter as the other shims (issue #73).
+            content = sanitize_system_prompt(content) or ""
+        if _is_empty_content(content):
+            return []
+        return [PromptMessage(role=role, content=content)]
+
+    if item_type == "reasoning":
+        # Carried as assistant context, like the native API feeds reasoning
+        # items back to the model. With ACP_SURFACE_TOOL_CALLS=false this is
+        # where the previous turn's kiro-cli tool activity lives, so dropping it
+        # made the model deny having run tools it had run.
+        text = _responses_reasoning_text(item)
+        return [PromptMessage(role="assistant", content=f"[reasoning]\n{text}")] if text else []
+
+    if item_type.endswith("_call") or item_type.endswith("_call_output"):
+        return _responses_tool_item_to_acp(item, item_type)
+
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        # A bare content part (e.g. {"type": "input_text", "text": ...}).
+        return [PromptMessage(role="user", content=text)]
+
+    logger.debug(f"Responses input item of type {item_type!r} carries no text; skipped")
+    return []
+
+
 def _responses_input_to_acp(
     input_value: Any,
     instructions: Optional[str],
 ) -> list[PromptMessage]:
     """Convert a Responses API ``input`` (+ ``instructions``) to ACP messages.
 
+    Role and tool provenance are preserved the same way as the Chat Completions
+    shim (:func:`_oai_messages_to_acp`):
+
+    * ``system`` / ``developer`` message items keep their roles (Codex sends
+      its sandbox/permission instructions as ``developer``).
+    * ``function_call`` / ``custom_tool_call`` / ``*_call`` items render as
+      ``[tool_use id=… name=…]``; ``*_call_output`` items render as
+      ``[tool_result id=…]`` (issue #43 markers).
+    * ``reasoning`` items render as ``[reasoning]`` assistant context.
+    * Items with no carriable content are skipped, never rendered as an empty
+      or ``None`` turn.
+
     Args:
-        input_value: Either a plain string prompt or a list of message items.
-            Each item is ``{"role": str, "content": str | list[part]}`` where a
-            part is a text part (``input_text``/``output_text``/``text``), an
-            ``input_image`` (forwarded as an image block), or an
+        input_value: Either a plain string prompt or a list of input items.
+            Message content parts may be text (``input_text``/``output_text``/
+            ``text``), ``input_image`` (forwarded as an image block), or
             ``input_file``/``input_audio`` (extracted or placeholdered — see
             :mod:`kiro.multimodal`, issue #33).
         instructions: Optional system-style instructions prepended to the turn.
@@ -808,8 +1061,13 @@ def _responses_input_to_acp(
     if instructions:
         # The Responses API ``instructions`` field is system-level guidance.
         # Preserve it as a distinct system role (rendered with a ``System:``
-        # label) rather than collapsing it into anonymous user text.
-        messages.append(PromptMessage(role="system", content=str(instructions)))
+        # label) rather than collapsing it into anonymous user text, filtered
+        # like every other system prompt (issue #73).
+        system_text = str(instructions)
+        if settings.SANITIZE_SYSTEM_PROMPTS:
+            system_text = sanitize_system_prompt(system_text) or ""
+        if system_text:
+            messages.append(PromptMessage(role="system", content=system_text))
 
     if isinstance(input_value, str):
         messages.append(PromptMessage(role="user", content=input_value))
@@ -817,22 +1075,7 @@ def _responses_input_to_acp(
 
     if isinstance(input_value, list):
         for item in input_value:
-            if not isinstance(item, dict):
-                messages.append(PromptMessage(role="user", content=str(item)))
-                continue
-            role = item.get("role", "user")
-            if role not in ("user", "assistant"):
-                role = "user"
-            content = item.get("content", "")
-            if isinstance(content, list):
-                # Normalise Responses content parts: input_image is forwarded as
-                # an ACP image block, input_file/document is extracted or
-                # placeholdered, input_audio is placeholdered (issue #33).
-                blocks: list[dict] = []
-                for part in content:
-                    blocks.extend(openai_part_to_blocks(part))
-                content = collapse_blocks(blocks)
-            messages.append(PromptMessage(role=role, content=content if isinstance(content, list) else str(content)))
+            messages.extend(_responses_item_to_acp(item))
         return messages
 
     # Fallback: stringify anything else.
@@ -880,7 +1123,9 @@ def _build_response_object(
         output.append({
             "type": "function_call",
             "id": f"fc_{uuid.uuid4().hex[:24]}",
-            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+            # Marked so an echoed function_call_output is recognisable as an
+            # already-executed kiro-cli call (see _is_executed_tool_echo).
+            "call_id": _responses_call_id(tc.get("id")),
             "name": tc.get("name", ""),
             "arguments": json.dumps(tc.get("arguments", {})),
             "status": "completed",
@@ -948,6 +1193,34 @@ async def create_response(
                 }
             },
         )
+    if _is_executed_tool_echo(body.input):
+        # The client is only returning outputs for kiro-cli tool calls that
+        # already ran inside the previous turn (which also already produced its
+        # final answer). Opening a new ACP turn here re-prompted kiro-cli with
+        # no new input; it re-checked its work, surfaced fresh tool calls and
+        # the client looped (live Codex probe). Complete with no output items
+        # instead — no function_call, so the client's turn ends, and no empty
+        # message, so the previous response's answer stays the turn's final
+        # message (an empty one replaced it as Codex's final output).
+        logger.info(
+            "Responses request only echoes already-executed kiro-cli tool calls; "
+            "completing without a new ACP turn"
+        )
+        echo = _build_response_object(
+            response_id=f"resp_{uuid.uuid4().hex[:24]}",
+            model=body.model,
+            created=int(time.time()),
+            text="",
+            tool_calls=[],
+            usage={},
+        )
+        if body.stream:
+            return StreamingResponse(
+                _responses_static_stream(echo),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        return echo
     messages = _responses_input_to_acp(body.input, body.instructions)
     tools = list(body.tools or [])
     fs_roots = build_filesystem_roots(
@@ -1016,6 +1289,30 @@ async def create_response(
         # clients can construct a valid response object (issue #74).
         include_empty_message=not text and not result.get("tool_calls"),
     )
+
+
+async def _responses_static_stream(response: dict) -> AsyncIterator[str]:
+    """Stream an output-less, already-built Responses object as SSE.
+
+    Used when the response is known without an ACP turn (an echo of
+    already-executed tool calls, which carries no output items).
+
+    Args:
+        response: A completed response object from
+            :func:`_build_response_object` with an empty ``output``.
+
+    Yields:
+        ``response.created``, ``response.in_progress`` and
+        ``response.completed`` frames.
+    """
+    pending = {**response, "status": "in_progress", "output": []}
+    frames = (
+        ("response.created", {"response": pending}),
+        ("response.in_progress", {"response": pending}),
+        ("response.completed", {"response": response}),
+    )
+    for seq, (event, data) in enumerate(frames):
+        yield f"event: {event}\ndata: {json.dumps({**data, 'type': event, 'sequence_number': seq})}\n\n"
 
 
 async def _responses_stream(
@@ -1239,7 +1536,7 @@ async def _responses_stream(
                 async for _ev in close_text():
                     yield _ev
 
-                tc_id = event.get("id", f"call_{uuid.uuid4().hex[:24]}")
+                tc_id = _responses_call_id(event.get("id"))
                 name = _sanitize_tool_name(event.get("name", ""))
                 arguments = event.get("arguments", {})
                 if tc_id not in tool_output_index:

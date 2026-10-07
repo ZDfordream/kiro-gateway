@@ -449,12 +449,47 @@ ACP would just concatenate them, adding no role fidelity). Tool turns are
   and a `tool` role result as `[tool_result id=…]`.
 - `_anthropic_messages_to_acp` renders `tool_use` / `tool_result` content blocks
   with the **same** markers, so the transcript is consistent across both shims.
+- `_responses_input_to_acp` (Responses API) renders `function_call` /
+  `custom_tool_call` / `local_shell_call` / hosted `*_call` items with the same
+  `[tool_use id=… name=…]` marker and every `*_call_output` as
+  `[tool_result id=…]`. It also keeps `developer`/`system` message roles (Codex
+  sends its sandbox/permission text as `developer`), carries `reasoning` item
+  summaries as `[reasoning]` assistant context (with `ACP_SURFACE_TOOL_CALLS=false`
+  that is where the previous turn's kiro-cli tool activity lives), and skips
+  items with no text (e.g. `encrypted_content`-only reasoning) instead of
+  rendering an empty or `None` turn. Verified against live Codex 0.160
+  (upstream jwadow/kiro-gateway#247).
 
-When touching prompt serialisation keep the two shims' markers identical and the
-turn order stable; assert the representation in tests (`TestBuildPromptBlocks`,
-`TestAnthropicMessagesToACP`, and the OpenAI assistant-tool_calls tests). This
-is about *carrying* prior tool turns in history — client-side function calling
-is still not honored by kiro-cli over ACP (issue #31).
+When touching prompt serialisation keep the three shims' markers identical and
+the turn order stable; assert the representation in tests (`TestBuildPromptBlocks`,
+`TestAnthropicMessagesToACP`, the OpenAI assistant-tool_calls tests and
+`TestResponsesInputItems*`). This is about *carrying* prior tool turns in
+history — client-side function calling is still not honored by kiro-cli over
+ACP (issue #31).
+
+### Responses echo guard (Codex tool loop)
+
+The Responses API has no `finish_reason`, so a client such as Codex treats any
+`function_call` output item as pending: it runs (or refuses) the call and posts a
+`function_call_output` back. With `ACP_SURFACE_TOOL_CALLS=true` the calls were
+already executed by kiro-cli inside the turn, and re-prompting kiro-cli with the
+echo made it re-check its work and surface fresh calls. Live Codex looped until
+it was killed, and every round cost credits. The Responses route therefore:
+
+- prefixes every surfaced call's `call_id` with `kiro_` (`_responses_call_id`,
+  both modes), and
+- answers a request whose trailing segment (after the last
+  `user`/`developer`/`system` message) holds only `*_call_output` items for
+  `kiro_` ids with an **output-less completed response, without opening an ACP
+  turn** (`_is_executed_tool_echo`). It emits no empty message, so the previous
+  response's answer stays the turn's final output.
+
+Stateless: the marker is the only signal, and nothing is stored. Outputs for
+client-owned call ids still go to kiro-cli as `[tool_result]` history. Don't
+map surfaced calls onto Codex's own tool names (`exec_command`, …): Codex would
+then **re-execute** commands kiro-cli already ran. Chat Completions and Messages
+don't need the guard, because their `finish_reason=stop` / `end_turn` already
+signals that the turn is complete. Tests: `TestResponsesExecutedToolEcho*`.
 
 ## Multimodal input (`kiro/multimodal.py`, issue #33)
 

@@ -2209,3 +2209,419 @@ class TestOpenAIResponsesKeepalive:
         assert resp.status_code == 200
         assert ": keepalive" not in resp.text
         assert "response.completed" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Responses input items + executed-tool echo guard (Codex, upstream issue #247).
+# Shapes below are the ones captured from a live Codex 0.160 session against
+# the gateway: Codex sends its sandbox/permission text as a ``developer``
+# message, resends ``reasoning`` items every turn, and answers every surfaced
+# ``function_call`` with a ``function_call_output``.
+# ---------------------------------------------------------------------------
+
+from kiro.routes_openai_shim import (  # noqa: E402
+    OAIMessage,
+    _is_executed_tool_echo,
+    _oai_messages_to_acp,
+    _responses_call_id,
+    _responses_input_to_acp,
+)
+
+
+def _rendered(messages) -> list[tuple[str, object]]:
+    """Return ``(role, content)`` pairs for compact assertions."""
+    return [(m.role, m.content) for m in messages]
+
+
+class TestResponsesInputItemsSuccess:
+    """Every Responses input item type is carried with its provenance."""
+
+    def test_developer_and_system_roles_preserved(self):
+        items = [
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "sandbox: read-only"}]},
+            {"type": "message", "role": "system", "content": "be terse"},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+        ]
+
+        result = _rendered(_responses_input_to_acp(items, None))
+
+        assert result == [
+            ("developer", "sandbox: read-only"),
+            ("system", "be terse"),
+            ("user", "hi"),
+        ]
+
+    def test_reasoning_summary_carried_as_assistant_context(self):
+        items = [{
+            "type": "reasoning", "id": "rs_1", "encrypted_content": None,
+            "summary": [{"type": "summary_text", "text": "Ran wc -c out.txt → 8"}],
+        }]
+
+        result = _rendered(_responses_input_to_acp(items, None))
+
+        assert result == [("assistant", "[reasoning]\nRan wc -c out.txt → 8")]
+
+    def test_reasoning_falls_back_to_content_text(self):
+        items = [{"type": "reasoning", "summary": [],
+                  "content": [{"type": "reasoning_text", "text": "raw thought"}]}]
+
+        assert _rendered(_responses_input_to_acp(items, None)) == [
+            ("assistant", "[reasoning]\nraw thought")
+        ]
+
+    def test_function_call_and_output_use_shared_markers(self):
+        items = [
+            {"type": "function_call", "call_id": "call_1", "name": "exec_command",
+             "arguments": "{\"cmd\": \"ls\"}"},
+            {"type": "function_call_output", "call_id": "call_1",
+             "output": "notes.txt\nout.txt"},
+        ]
+
+        result = _rendered(_responses_input_to_acp(items, None))
+
+        assert result == [
+            ("assistant", "[tool_use id=call_1 name=exec_command]\n{\"cmd\": \"ls\"}"),
+            ("user", "[tool_result id=call_1]\nnotes.txt\nout.txt"),
+        ]
+
+    def test_markers_match_chat_completions_shim(self):
+        """The same tool turn renders identically on /responses and /chat."""
+        chat = _oai_messages_to_acp([
+            OAIMessage(role="assistant", content=None, tool_calls=[{
+                "id": "call_1", "type": "function",
+                "function": {"name": "exec_command", "arguments": "{\"cmd\": \"ls\"}"},
+            }]),
+            OAIMessage(role="tool", tool_call_id="call_1", content="done"),
+        ])
+        responses = _responses_input_to_acp([
+            {"type": "function_call", "call_id": "call_1", "name": "exec_command",
+             "arguments": "{\"cmd\": \"ls\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+        ], None)
+
+        assert _rendered(responses) == _rendered(chat)
+
+    def test_function_call_output_content_part_list(self):
+        items = [{"type": "function_call_output", "call_id": "c",
+                  "output": [{"type": "input_text", "text": "line1"},
+                             {"type": "input_text", "text": "line2"}]}]
+
+        assert _rendered(_responses_input_to_acp(items, None)) == [
+            ("user", "[tool_result id=c]\nline1\nline2")
+        ]
+
+    def test_custom_tool_call_freeform_input(self):
+        patch_text = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"
+        items = [
+            {"type": "custom_tool_call", "call_id": "c2", "name": "apply_patch",
+             "input": patch_text},
+            {"type": "custom_tool_call_output", "call_id": "c2", "output": "ok"},
+        ]
+
+        assert _rendered(_responses_input_to_acp(items, None)) == [
+            ("assistant", f"[tool_use id=c2 name=apply_patch]\n{patch_text}"),
+            ("user", "[tool_result id=c2]\nok"),
+        ]
+
+    def test_local_shell_call_named_from_type(self):
+        action = {"type": "exec", "command": ["ls", "-la"]}
+        items = [{"type": "local_shell_call", "call_id": "c3", "action": action}]
+
+        assert _rendered(_responses_input_to_acp(items, None)) == [
+            ("assistant", f"[tool_use id=c3 name=local_shell]\n{json.dumps(action)}")
+        ]
+
+    def test_mcp_call_carries_inline_output(self):
+        items = [{"type": "mcp_call", "id": "mcp_1", "server_label": "docs",
+                  "name": "search", "arguments": "{\"q\": \"x\"}", "output": "hit"}]
+
+        assert _rendered(_responses_input_to_acp(items, None)) == [
+            ("assistant", "[tool_use id=mcp_1 name=docs/search]\n{\"q\": \"x\"}"),
+            ("user", "[tool_result id=mcp_1]\nhit"),
+        ]
+
+    def test_codex_resume_transcript_keeps_order(self):
+        items = [
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "perms"}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "create out.txt"}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "wrote it"}],
+             "encrypted_content": None},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Done."}]},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "what did you run?"}]},
+        ]
+
+        result = _rendered(_responses_input_to_acp(items, "sys"))
+
+        assert result == [
+            ("system", "sys"),
+            ("developer", "perms"),
+            ("user", "create out.txt"),
+            ("assistant", "[reasoning]\nwrote it"),
+            ("assistant", "Done."),
+            ("user", "what did you run?"),
+        ]
+
+    def test_image_part_still_forwarded_as_block(self):
+        items = [{"role": "user", "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+        ]}]
+
+        content = _responses_input_to_acp(items, None)[0].content
+
+        assert isinstance(content, list)
+        assert any(block.get("type") == "image" for block in content)
+
+
+class TestResponsesInputItemsEdgeCases:
+    """Items without carriable content never become empty or ``None`` turns."""
+
+    def test_encrypted_only_reasoning_is_skipped(self):
+        items = [{"type": "reasoning", "summary": [], "content": None,
+                  "encrypted_content": "gAAAAB..."}]
+
+        assert _responses_input_to_acp(items, None) == []
+
+    def test_no_message_renders_none_literal(self):
+        items = [
+            {"type": "reasoning", "id": "rs", "summary": [], "content": None},
+            {"type": "message", "role": "user", "content": None},
+            {"type": "item_reference", "id": "msg_1"},
+            {"type": "function_call", "call_id": "c", "name": "f", "arguments": None},
+        ]
+
+        for message in _responses_input_to_acp(items, None):
+            assert "None" not in str(message.content)
+
+    def test_empty_and_whitespace_messages_skipped(self):
+        items = [{"role": "user", "content": ""}, {"role": "user", "content": "  "},
+                 {"role": "user", "content": []}]
+
+        assert _responses_input_to_acp(items, None) == []
+
+    def test_unknown_role_falls_back_to_user(self):
+        assert _rendered(_responses_input_to_acp(
+            [{"role": "critic", "content": "x"}], None
+        )) == [("user", "x")]
+
+    def test_bare_input_text_part_is_user_text(self):
+        assert _rendered(_responses_input_to_acp(
+            [{"type": "input_text", "text": "loose part"}], None
+        )) == [("user", "loose part")]
+
+    def test_non_dict_item_stringified(self):
+        assert _rendered(_responses_input_to_acp(["plain"], None)) == [("user", "plain")]
+
+    def test_developer_text_sanitized_like_chat_shim(self, monkeypatch):
+        monkeypatch.setattr(_settings, "SANITIZE_SYSTEM_PROMPTS", True)
+        text = "You are Claude Code, Anthropic's CLI.\nKeep answers short."
+        items = [{"role": "developer", "content": text}]
+
+        responses = _responses_input_to_acp(items, text)
+        chat = _oai_messages_to_acp([OAIMessage(role="developer", content=text)])
+
+        assert responses[1].content == chat[0].content
+        assert "Claude Code" not in responses[0].content
+        assert "Keep answers short." in responses[0].content
+
+    def test_sanitizer_opt_out_keeps_verbatim(self, monkeypatch):
+        monkeypatch.setattr(_settings, "SANITIZE_SYSTEM_PROMPTS", False)
+        text = "You are Claude Code.\nKeep answers short."
+
+        result = _responses_input_to_acp([{"role": "developer", "content": text}], text)
+
+        assert _rendered(result) == [("system", text), ("developer", text)]
+
+
+class TestResponsesExecutedToolEchoDetection:
+    """``_is_executed_tool_echo`` recognises only pure echoes of kiro calls."""
+
+    _CODEX_LOOP = [
+        {"type": "message", "role": "user", "content": "append once"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "t"}]},
+        {"type": "function_call", "call_id": "kiro_toolu_1", "name": "bash",
+         "arguments": "{}"},
+        {"type": "message", "role": "assistant", "content": "Appended."},
+        {"type": "function_call_output", "call_id": "kiro_toolu_1",
+         "output": "unsupported call: bash"},
+    ]
+
+    def test_codex_loop_shape_is_echo(self):
+        assert _is_executed_tool_echo(self._CODEX_LOOP) is True
+
+    def test_new_user_message_after_outputs_is_not_echo(self):
+        items = [*self._CODEX_LOOP, {"role": "user", "content": "next question"}]
+
+        assert _is_executed_tool_echo(items) is False
+
+    def test_client_owned_call_output_is_not_echo(self):
+        items = [*self._CODEX_LOOP,
+                 {"type": "function_call_output", "call_id": "call_abc", "output": "x"}]
+
+        assert _is_executed_tool_echo(items) is False
+
+    def test_custom_tool_call_output_counts(self):
+        items = [{"role": "user", "content": "q"},
+                 {"type": "custom_tool_call_output", "call_id": "kiro_c", "output": ""}]
+
+        assert _is_executed_tool_echo(items) is True
+
+    @pytest.mark.parametrize("value", [
+        "plain string",
+        [],
+        [{"role": "user", "content": "q"}],
+        [{"role": "user", "content": "q"},
+         {"type": "function_call", "call_id": "kiro_1", "name": "bash"}],
+        None,
+    ])
+    def test_inputs_without_echoed_outputs(self, value):
+        assert _is_executed_tool_echo(value) is False
+
+    def test_call_id_marking_is_idempotent(self):
+        marked = _responses_call_id("toolu_1")
+
+        assert marked == "kiro_toolu_1"
+        assert _responses_call_id(marked) == marked
+        assert _responses_call_id(None).startswith("kiro_call_")
+        assert _responses_call_id("") != _responses_call_id("")
+
+
+class _SurfacedToolACP(_ThinkingACP):
+    """ACP stub whose turn runs one built-in tool, then answers."""
+
+    async def prompt(self, params):
+        return {
+            "content": "Appended.", "reasoning": "",
+            "tool_calls": [{"id": "toolu_1", "name": "Running: echo hi",
+                            "kind": "execute", "arguments": {"command": "echo hi"}}],
+            "finish_reason": "stop", "usage": {},
+        }
+
+    async def prompt_stream(self, params):
+        yield {"type": "tool_call", "id": "toolu_1", "name": "Running: echo hi",
+               "kind": "execute", "arguments": {"command": "echo hi"}}
+        yield {"type": "text", "content": "Appended."}
+        yield {"type": "done", "finish_reason": "stop", "usage": {}}
+
+
+class _NoTurnACP(_ThinkingACP):
+    """ACP stub that fails the test if any ACP turn is opened."""
+
+    async def new_session(self, *args, **kwargs):
+        raise AssertionError("an echo request must not open an ACP session")
+
+    async def prompt(self, params):
+        raise AssertionError("an echo request must not prompt kiro-cli")
+
+    async def prompt_stream(self, params):
+        raise AssertionError("an echo request must not prompt kiro-cli")
+        yield {}  # pragma: no cover - makes this an async generator
+
+
+class TestResponsesExecutedToolEchoRoute:
+    """Surfaced kiro tool calls are marked; their echoes end the client loop."""
+
+    _BASE = {"model": "claude-sonnet-4.6", "input": "append once"}
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_surfaced_function_calls_carry_marked_call_id(
+        self, sync_client, openai_headers, monkeypatch, stream
+    ):
+        monkeypatch.setattr(_settings, "ACP_SURFACE_TOOL_CALLS", True)
+        sync_client.app.state.shim_service = _ShimService(_SurfacedToolACP())
+
+        resp = sync_client.post("/v1/responses", json={**self._BASE, "stream": stream},
+                                headers=openai_headers)
+
+        assert resp.status_code == 200
+        if stream:
+            events = _sse_events(resp.text)
+            _assert_valid_responses_item_lifecycle(events)
+            output = next(e for e in events
+                          if e.get("type") == "response.completed")["response"]["output"]
+            streamed = [e["item"]["call_id"] for e in events
+                        if e.get("type") == "response.output_item.done"
+                        and e["item"]["type"] == "function_call"]
+            assert streamed == ["kiro_toolu_1"]
+        else:
+            output = resp.json()["output"]
+        calls = [item for item in output if item["type"] == "function_call"]
+        assert [c["call_id"] for c in calls] == ["kiro_toolu_1"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_echo_completes_without_acp_turn(
+        self, sync_client, openai_headers, stream
+    ):
+        sync_client.app.state.shim_service = _ShimService(_NoTurnACP())
+        payload = {
+            "model": "claude-sonnet-4.6", "stream": stream,
+            "input": TestResponsesExecutedToolEchoDetection._CODEX_LOOP,
+        }
+
+        resp = sync_client.post("/v1/responses", json=payload, headers=openai_headers)
+
+        assert resp.status_code == 200
+        if stream:
+            events = _sse_events(resp.text)
+            _assert_valid_responses_item_lifecycle(events)
+            assert events[0]["type"] == "response.created"
+            body = next(e for e in events
+                        if e.get("type") == "response.completed")["response"]
+            assert [e["sequence_number"] for e in events] == list(range(len(events)))
+        else:
+            body = resp.json()
+        assert body["status"] == "completed"
+        # No items at all: no function_call (ends the loop) and no empty
+        # message (would replace the previous answer as the final output).
+        assert body["output"] == []
+        assert body["output_text"] == ""
+        assert body["usage"]["input_tokens"] == 0
+        assert body["usage"]["output_tokens"] == 0
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_round_trip_of_surfaced_response_ends_loop(
+        self, sync_client, openai_headers, monkeypatch, stream
+    ):
+        """Feeding a surfaced response back the way Codex does opens no turn."""
+        monkeypatch.setattr(_settings, "ACP_SURFACE_TOOL_CALLS", True)
+        sync_client.app.state.shim_service = _ShimService(_SurfacedToolACP())
+        first = sync_client.post("/v1/responses", json=self._BASE,
+                                 headers=openai_headers).json()
+        follow_up = [{"role": "user", "content": self._BASE["input"]}, *first["output"]]
+        follow_up += [
+            {"type": "function_call_output", "call_id": item["call_id"],
+             "output": "unsupported call: bash"}
+            for item in first["output"] if item["type"] == "function_call"
+        ]
+        sync_client.app.state.shim_service = _ShimService(_NoTurnACP())
+
+        resp = sync_client.post(
+            "/v1/responses",
+            json={"model": "claude-sonnet-4.6", "input": follow_up, "stream": stream},
+            headers=openai_headers,
+        )
+
+        assert resp.status_code == 200
+        assert '"function_call"' not in resp.text
+
+    def test_client_owned_output_still_prompts_kiro(self, sync_client, openai_headers):
+        rec = _RecordingShim()
+        sync_client.app.state.shim_service = rec
+        payload = {"model": "claude-sonnet-4.6", "input": [
+            {"role": "user", "content": "q"},
+            {"type": "function_call", "call_id": "call_x", "name": "lookup",
+             "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_x", "output": "42"},
+        ]}
+
+        resp = sync_client.post("/v1/responses", json=payload, headers=openai_headers)
+
+        assert resp.status_code == 200
+        rendered = _rendered(rec.complete_kwargs[0]["messages"])
+        assert rendered[-1] == ("user", "[tool_result id=call_x]\n42")
