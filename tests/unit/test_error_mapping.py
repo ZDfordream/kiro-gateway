@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from kiro.acp_client import ACPError
+from kiro.identity_scrub import NEUTRAL_TOKEN
 from kiro.error_mapping import (
     MappedError,
     classify_error,
@@ -162,7 +163,7 @@ class TestErrorMessageIdentity:
         err = classify_error("kiro-cli exited while the gateway was proxying")
 
         assert "kiro" not in err.message.lower()
-        assert "the tool" in err.message
+        assert NEUTRAL_TOKEN in err.message
 
     def test_fallback_messages_carry_no_brand_words(self):
         err = classify_error("")

@@ -1,12 +1,15 @@
 """Unit tests for kiro.identity_scrub (runtime-identity scrubbing on output).
 
-Two layers, both replacing hits with the neutral token ``the tool``:
+Two layers, both replacing hits with the neutral token ``NEUTRAL_TOKEN``:
 
 * **Brand layer** — unconditional: every spelling of the gateway/CLI product
   name goes, no matter the surrounding prose.
-* **Generic layer** — conditional: bare ``gateway`` / ``网关`` is a legitimate
-  English/Chinese word (API Gateway, Kong, ``api_gateway``), so it is only
+* **Generic layer** — conditional: bare ``gateway`` / ``网关`` / ``mcp`` is
+  legitimate English/Chinese or ordinary technical vocabulary, so it is only
   replaced when the same sentence carries runtime context.
+
+Code-shaped spans (paths, identifiers, backticks, quoted strings) are never
+touched: a reply that names the file it just edited has to stay readable.
 """
 from __future__ import annotations
 
@@ -63,6 +66,18 @@ class TestBrandLayer:
     def test_adjacent_punctuation_is_kept(self):
         assert scrub_identity("(kiro-cli)") == f"({NEUTRAL_TOKEN})"
 
+    def test_preceding_article_is_swallowed(self):
+        # Otherwise "the kiro-gateway project" reads as "the the <token> project".
+        assert (
+            scrub_identity("the kiro-gateway project")
+            == f"{NEUTRAL_TOKEN} project"
+        )
+
+    def test_article_swallow_does_not_eat_the_previous_word(self):
+        # "man kiro-cli" must not eat into "man" — the article needs its
+        # own word boundary.
+        assert scrub_identity("man kiro-cli") == f"man {NEUTRAL_TOKEN}"
+
     def test_internal_identifiers_are_not_split(self):
         # ``KiroGatewayError`` has no word boundary after "Kiro"; it is source
         # code the user may be discussing and must survive verbatim.
@@ -82,10 +97,13 @@ class TestGenericLayer:
             == f"the request goes through {NEUTRAL_TOKEN} to {NEUTRAL_TOKEN}"
         )
 
-    def test_scrubs_gateway_when_sentence_has_runtime_context(self):
+    def test_scrubs_gateway_when_sentence_names_the_runtime(self):
+        # "runtime" is a genuine signal; "transport"/"stdio"/"gateway" alone
+        # are not, so they are only rewritten once something unmistakable
+        # appears in the sentence.
         assert (
-            scrub_identity("the transport is a gateway over stdio")
-            == f"the transport is {NEUTRAL_TOKEN} over stdio"
+            scrub_identity("the runtime is a gateway over stdio")
+            == f"the runtime is {NEUTRAL_TOKEN} over {NEUTRAL_TOKEN}"
         )
 
     def test_scrubs_chinese_gateway_with_context(self):
@@ -146,6 +164,99 @@ class TestFalsePositives:
     def test_generic_cli_agent_phrase_is_preserved(self):
         # No version marker, so this is ordinary prose about a CLI agent.
         assert scrub_identity("we shipped a CLI agent") == "we shipped a CLI agent"
+
+
+# ---------------------------------------------------------------------------
+# Code-shaped spans must survive — a reply has to stay usable
+# ---------------------------------------------------------------------------
+
+class TestProtectedSpans:
+    """Paths, identifiers, backticks and quotes are never rewritten."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Edit kiro/acp_client.py line 42",
+            "Add a comment in kiro/config.py",
+            "see ./kiro/gateway.md for details",
+            "raised KiroGatewayError from the bridge",
+            "set self.api_gateway = None",
+            "run `grep -rn kiro kiro/`",
+            'grep -rn "gateway" kiro/',
+            "call mcp__feishu__send_message",
+            "the KiroGatewayHandler class is gone",
+        ],
+    )
+    def test_code_shaped_text_is_verbatim(self, raw: str):
+        assert scrub_identity(raw) == raw
+
+    def test_prose_still_gets_rewritten(self):
+        assert (
+            scrub_identity("I'm Kiro, behind the gateway")
+            == f"I'm {NEUTRAL_TOKEN}, behind {NEUTRAL_TOKEN}"
+        )
+
+    def test_a_protected_span_is_not_a_context_signal(self):
+        # "kiro-cli" here is the user's search term. It must neither be
+        # rewritten nor license rewriting "gateway" further along the sentence.
+        text = 'grep -rn "kiro-cli" then deploy the payment gateway'
+        assert scrub_identity(text) == text
+
+    def test_prose_adjacent_to_protected_code_is_still_rewritten(self):
+        text = "kiro-cli edited kiro/acp_client.py"
+        assert scrub_identity(text) == f"{NEUTRAL_TOKEN} edited kiro/acp_client.py"
+
+    def test_inline_backticks_protect_but_fences_do_not(self):
+        # An inline span is a path or command the user named — keep it. A
+        # fenced block is generated output (shell results, search hits), which
+        # is exactly where the runtime leaks, so its prose gets scrubbed.
+        text = "run `kiro-cli --help`:\n```\nkiro-cli 2.26.1 ready\n```"
+        assert scrub_identity(text) == (
+            "run `kiro-cli --help`:\n```\n"
+            f"{NEUTRAL_TOKEN} 2.26.1 ready\n```"
+        )
+
+    def test_paths_in_shell_output_are_kept(self):
+        text = "```\nkiro-cli edited kiro/acp_client.py\n```"
+        assert scrub_identity(text) == (
+            f"```\n{NEUTRAL_TOKEN} edited kiro/acp_client.py\n```"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Wider vocabulary — only with runtime context
+# ---------------------------------------------------------------------------
+
+class TestWiderTermList:
+    """mcp/acp/subprocess & co. are ordinary words until context appears."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "pip install mcp",
+            "the MCP server list is in config",
+            "json-rpc over stdio to the subprocess",
+            "use the proxy for outbound calls",
+            "our test harness runs nightly",
+        ],
+    )
+    def test_bare_infrastructure_words_survive_without_context(self, raw: str):
+        assert scrub_identity(raw) == raw
+
+    def test_contextual_mcp_and_transport_are_rewritten(self):
+        assert scrub_identity(
+            "kiro-cli registers the MCP servers over the transport"
+        ) == f"{NEUTRAL_TOKEN} registers {NEUTRAL_TOKEN} servers over {NEUTRAL_TOKEN}"
+
+    def test_contextual_subprocess_chain_is_rewritten(self):
+        assert scrub_identity(
+            "the gateway calls the subprocess, backed by kiro-cli"
+        ) == f"{NEUTRAL_TOKEN} calls {NEUTRAL_TOKEN}, backed by {NEUTRAL_TOKEN}"
+
+    def test_contextual_chinese_proxy_is_rewritten(self):
+        assert scrub_identity(
+            "请求经过网关与代理到达 kiro-cli"
+        ) == f"请求经过{NEUTRAL_TOKEN}与{NEUTRAL_TOKEN}到达 {NEUTRAL_TOKEN}"
 
 
 # ---------------------------------------------------------------------------

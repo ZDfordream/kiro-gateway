@@ -7,14 +7,17 @@ removes those brandings so a client never learns what sits behind the API.
 Two layers, both rewriting hits to the neutral token :data:`NEUTRAL_TOKEN`:
 
 * **Brand layer** — unconditional. Every spelling of the product name goes,
-  regardless of surrounding prose. Internal identifiers are protected by word
-  boundaries, so ``KiroGatewayError`` and ``kiro_gateway`` survive verbatim.
-* **Generic layer** — conditional. Bare ``gateway`` / ``网关`` is ordinary
-  English/Chinese (``AWS API Gateway``, ``Kong gateway``, ``api_gateway``), so
-  it is replaced only when the same sentence already carries runtime context —
-  a brand token, the post-scrub marker, or a transport-ish word. Context is
-  read from the whole sentence available in the buffer, so a streamed chunk
-  only sees context that arrived with it.
+  regardless of surrounding prose.
+* **Generic layer** — conditional. ``gateway`` / ``mcp`` / ``subprocess`` and
+  friends are ordinary technical vocabulary, so they are replaced only when
+  the same sentence already names the runtime (a brand token or
+  :data:`NEUTRAL_TOKEN`).
+
+Code-shaped spans are never touched: paths, identifiers, backtick spans and
+quoted strings survive verbatim, so a reply that names the file it just edited
+or the pattern it just grepped for stays usable. A protected span also never
+counts as a runtime-context signal — a user's search for ``"kiro-cli"`` must
+not license rewriting the rest of the sentence.
 
 The whole pass is opt-out via :class:`IdentityScrubber` (``enabled=False``) or
 the ``SCRUB_RUNTIME_IDENTITY`` setting wired in at the call sites.
@@ -26,46 +29,76 @@ import re
 from loguru import logger
 
 #: Every brand hit is rewritten to this. Deliberately generic and unbranded.
-NEUTRAL_TOKEN = "the tool"
+NEUTRAL_TOKEN = "the agent"
 
 #: Word characters plus ``_``. A brand token touching one of these is part of
 #: an identifier (``KiroGatewayError``, ``kiro_gateway``) and must not be cut.
 _BOUND = r"(?<![A-Za-z0-9_])"
 _END = r"(?![A-Za-z0-9_])"
 
+#: A leading article is consumed with the brand token so "the kiro-gateway
+#: project" becomes "the <token> project" rather than "the the <token> project".
+#: The word boundary on the article keeps "man kiro-cli" from eating "man".
+_ARTICLE = r"(?:\b(?:the|a|an)\s+)?"
+
 # Longest first: the CLI banner must be consumed before the shorter CLI form,
-# or "Kiro CLI Agent v2.26.1" would degrade to "the tool Agent v2.26.1".
+# or "Kiro CLI Agent v2.26.1" would degrade to "<token> Agent v2.26.1".
 _BRAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        _BOUND + r"kiro[\s_-]*cli[\s_-]*agent(?:\s+v?\d[\w.\-]*)?" + _END,
+        _ARTICLE + _BOUND + r"kiro[\s_-]*cli[\s_-]*agent(?:\s+v?\d[\w.\-]*)?" + _END,
         re.IGNORECASE,
     ),
     # The banner without the product name, identifiable by its version marker.
     # The version is required — a bare "CLI agent" is ordinary prose.
     re.compile(
-        _BOUND + r"(?:(?:the|a|an)\s+)?cli[\s_-]*agent\s+v?\d[\w.\-]*" + _END,
+        _ARTICLE + _BOUND + r"cli[\s_-]*agent\s+v?\d[\w.\-]*" + _END,
         re.IGNORECASE,
     ),
-    re.compile(_BOUND + r"kiro[\s_-]*gateway" + _END, re.IGNORECASE),
-    re.compile(_BOUND + r"kiro[\s_-]*cli" + _END, re.IGNORECASE),
-    re.compile(_BOUND + r"kiro" + _END, re.IGNORECASE),
+    re.compile(_ARTICLE + _BOUND + r"kiro[\s_-]*gateway" + _END, re.IGNORECASE),
+    re.compile(_ARTICLE + _BOUND + r"kiro[\s_-]*cli" + _END, re.IGNORECASE),
+    re.compile(_ARTICLE + _BOUND + r"kiro" + _END, re.IGNORECASE),
 )
 
-#: Generic infrastructure words, replaced only with nearby runtime context.
-#: A leading article is part of the match so ``a gateway`` becomes ``the tool``
-#: rather than the dangling ``a the tool``. Chinese has no article to swallow.
+# Code-shaped spans, matched leftmost and never rewritten. Quotes and
+# identifiers/paths apply everywhere; inline backticks apply everywhere except
+# inside a fenced block (see _protected_spans).
+_PROTECTED_ALWAYS = re.compile(
+    r"\"[^\"]*\""  # double-quoted strings (search terms, args)
+    r"|'[^']*'"  # single-quoted strings
+    r"|(?:[^\s/]+/)+[^\s]*"  # paths, including trailing-slash directories
+    r"|\b[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+\b"  # snake_case / dunder names
+    r"|\b[a-z]+[A-Z][A-Za-z0-9]*\b"  # camelCase
+    r"|\b[A-Z][a-z]+[A-Z][A-Za-z0-9]*\b"  # PascalCase
+)
+
+#: Inline code spans. Deliberately single-line: a stray backtick must not
+#: swallow the rest of the reply into a protected region.
+_PROTECTED_INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+#: Infrastructure vocabulary, replaced only with runtime context. A leading
+#: article is swallowed so "the gateway" becomes the token, not "the <token>".
+#: Boundaries are ASCII-aware rather than ``\b``: CJK glyphs are word
+#: characters, so ``\b`` never fires between 汉字 and would block 网关/代理.
 _GENERIC_PATTERN = re.compile(
-    r"(?:(?:the|a|an)\s+)?\bgateway\b|网关", re.IGNORECASE
+    _ARTICLE
+    + _BOUND
+    + r"(?:"
+    r"gateway|网关|"
+    r"mcp|acp|"
+    r"subprocess|stdio|json-?rpc|harness|"
+    r"proxy|bridge|transport|backend|"
+    r"代理|进程|传输"
+    r")"
+    + _END,
+    re.IGNORECASE,
 )
 
-#: Words that mark the sentence as talking about the hidden runtime. Bare
-#: ``cli``/``acp`` are deliberately absent: they are far too common in ordinary
-#: code talk to justify rewriting a neighbouring ``gateway``. ``gateway`` /
-#: ``网关`` themselves are absent too — the generic pattern already matches
-#: them, and listing them would make every hit its own context signal.
+#: What makes a sentence "about the hidden runtime". Kept deliberately small
+#: and free of the words above: a term that is both a signal and a candidate
+#: would license rewriting itself, and then "json-rpc over stdio" — ordinary
+#: technical prose — would be mangled.
 _CONTEXT_PATTERN = re.compile(
-    r"\b(?:kiro\w*|runtime|transport|backend|subprocess|stdio|harness|"
-    r"proxy|bridge|json-?rpc)\b|the tool|运行时|后端|传输",
+    rf"\bkiro\w*\b|\bruntime\b|\b{re.escape(NEUTRAL_TOKEN)}\b|运行时",
     re.IGNORECASE,
 )
 
@@ -81,10 +114,80 @@ _PRODUCT_PATTERN = re.compile(
 _SENTENCE_START = re.compile(r"[.!?](?=\s|$)|[。！？\n]")
 
 
+#: Fenced code blocks. These hold tool *output* — shell results, search hits,
+#: diffs — which is exactly where the runtime leaks, so they are deliberately
+#: NOT protected the way inline backtick spans are. The renderer wraps shell
+#: output in fences on purpose; protecting them would disable the scrub on its
+#: most important surface.
+_FENCE = re.compile(r"```.*?```", re.DOTALL)
+
+
+def _protected_spans(text: str) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` of every code-shaped span in *text*.
+
+    Two tiers:
+
+    * Quotes, paths and identifiers are protected **everywhere** — including
+      inside a fenced block, where a path is still a path and mangling it
+      would make the reply useless.
+    * Inline backticks are protected **except** inside a fenced block. A fence
+      holds generated output (shell results, search hits, diffs) — exactly
+      where the runtime leaks — while an inline span is a path or command the
+      user named.
+    """
+    fenced = [m.span() for m in _FENCE.finditer(text)]
+    spans = [m.span() for m in _PROTECTED_ALWAYS.finditer(text)]
+    for match in _PROTECTED_INLINE_CODE.finditer(text):
+        if _overlaps(fenced, match.start(), match.end()):
+            continue
+        spans.append(match.span())
+    return spans
+
+
+def _overlaps(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    """Return whether ``[start, end)`` intersects any protected span."""
+    return any(start < hi and lo < end for lo, hi in spans)
+
+
+def _mask_protected(text: str) -> str:
+    """Blank out code-shaped spans, preserving length.
+
+    Context detection runs on the masked copy so a user's quoted search term
+    can never act as a runtime-context signal.
+    """
+    spans = _protected_spans(text)
+    if not spans:
+        return text
+    chars = list(text)
+    for lo, hi in spans:
+        for i in range(lo, hi):
+            if not chars[i].isspace():
+                chars[i] = " "
+    return "".join(chars)
+
+
+def _sub_unprotected(text: str, pattern: re.Pattern[str], replacement: str) -> str:
+    """Apply *pattern* everywhere it does not touch a code-shaped span."""
+    spans = _protected_spans(text)
+    if not spans:
+        return pattern.sub(replacement, text)
+
+    out: list[str] = []
+    pos = 0
+    for match in pattern.finditer(text):
+        if _overlaps(spans, match.start(), match.end()):
+            continue
+        out.append(text[pos : match.start()])
+        out.append(replacement)
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _scrub_brand(text: str) -> str:
     """Replace every product-name spelling with :data:`NEUTRAL_TOKEN`."""
     for pattern in _BRAND_PATTERNS:
-        text = pattern.sub(NEUTRAL_TOKEN, text)
+        text = _sub_unprotected(text, pattern, NEUTRAL_TOKEN)
     return text
 
 
@@ -101,15 +204,19 @@ def _sentence_bounds(text: str, position: int) -> tuple[int, int]:
 
 
 def _scrub_generic(text: str) -> str:
-    """Replace ``gateway``/``网关`` only where the sentence gives context."""
+    """Replace infrastructure words only where the sentence gives context."""
+    masked = _mask_protected(text)
+    spans = _protected_spans(text)
 
     def replace(match: re.Match[str]) -> str:
         start, end = match.span()
+        if _overlaps(spans, start, end):
+            return match.group(0)
         prefix = text[max(0, start - 24) : start]
         if _PRODUCT_PATTERN.search(prefix):
             return match.group(0)
         lo, hi = _sentence_bounds(text, start)
-        return NEUTRAL_TOKEN if _CONTEXT_PATTERN.search(text[lo:hi]) else match.group(0)
+        return NEUTRAL_TOKEN if _CONTEXT_PATTERN.search(masked[lo:hi]) else match.group(0)
 
     return _GENERIC_PATTERN.sub(replace, text)
 
@@ -155,10 +262,10 @@ _DEFAULT_SCRUBBER = IdentityScrubber()
 
 #: Literal phrases a held tail may grow into. The ``kiro cli agent`` banner is
 #: deliberately absent: holding for it would stall every ``kiro-cli`` delta on
-#: the chance that `` agent`` follows, and a released ``the tool Agent`` is
-#: cosmetic damage, not a leak. The article-led generic phrases are present so
-#: ``the `` is never emitted before ``gateway`` is recognised — otherwise the
-#: article survives to collide with the replacement token.
+#: the chance that `` agent`` follows, and a released banner fragment is
+#: cosmetic damage, not a leak. The article-led phrases are present so ``the ``
+#: is never emitted before the token is recognised — otherwise the article
+#: survives to collide with the replacement.
 _HOLDBACK_CANDIDATES: tuple[str, ...] = (
     "kiro gateway",
     "kiro cli",

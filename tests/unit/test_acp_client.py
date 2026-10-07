@@ -14,6 +14,7 @@ import pytest_asyncio
 # Patch acp_client's own settings reference: another test reloads kiro.config,
 # so kiro.config.settings is not the object the module reads.
 from kiro.acp_client import ACPClient, ACPError, settings as _acp_settings
+from kiro.identity_scrub import NEUTRAL_TOKEN
 from kiro.acp_models import PromptMessage, PromptParams, ACPToolDefinition
 
 # Capture the genuine new_session implementation at import time. The
@@ -2663,7 +2664,7 @@ class TestOutputIdentityScrub:
 
         text = "".join(e.get("content", "") for e in got if e.get("type") == "text")
         assert "kiro" not in text.lower()
-        assert "the tool" in text
+        assert NEUTRAL_TOKEN in text
 
     @pytest.mark.asyncio
     async def test_held_tail_is_flushed_before_done(self, monkeypatch):
@@ -2737,4 +2738,63 @@ class TestOutputIdentityScrub:
             result = await run
 
         assert "kiro" not in result["content"].lower()
-        assert "the tool" in result["content"]
+        assert NEUTRAL_TOKEN in result["content"]
+
+
+# ---------------------------------------------------------------------------
+# Tool-activity rendering must scrub runtime identity too
+#
+# During a bug-fix session the visible work is tool calls: names, arguments,
+# diffs, shell output, search summaries and the task list. That surface was
+# never scrubbed, so "grep -r kiro-cli" and friends went to the client raw.
+# ---------------------------------------------------------------------------
+
+class TestToolActivityIdentityScrub:
+    """Rendered tool activity drops brandings but keeps code readable."""
+
+    def test_tool_name_branding_is_scrubbed(self):
+        out = render_tool_activity(
+            {"type": "tool_call", "name": "Running: kiro-cli doctor", "kind": "execute",
+             "content": []}
+        )
+        assert "kiro" not in out.lower()
+        assert NEUTRAL_TOKEN in out
+
+    def test_tool_summary_branding_is_scrubbed(self):
+        out = render_tool_call_summary(
+            {"name": "Reading kiro-cli README", "kind": "read", "arguments": {},
+             "content": [], "output": ""}
+        )
+        assert "kiro" not in out.lower()
+
+    def test_plan_text_branding_is_scrubbed(self):
+        out = format_plan_text(
+            [{"content": "patch kiro-cli adapter", "status": "in_progress"}], ""
+        )
+        assert "kiro" not in out.lower()
+
+    def test_paths_inside_tool_activity_survive(self):
+        out = render_tool_activity({
+            "type": "tool_call",
+            "name": "Editing",
+            "kind": "edit",
+            "arguments": {"path": "kiro/acp_client.py"},
+            "content": [],
+        })
+        assert "kiro/acp_client.py" in out
+
+    def test_shell_output_branding_is_scrubbed(self):
+        out = render_tool_activity({
+            "type": "tool_call_update",
+            "kind": "execute",
+            "output": "kiro-cli 2.26.1 ready",
+        })
+        assert "kiro" not in out.lower()
+
+    def test_scrub_can_be_disabled_for_tool_activity(self, monkeypatch):
+        monkeypatch.setattr(_acp_settings, "SCRUB_RUNTIME_IDENTITY", False)
+        out = render_tool_activity(
+            {"type": "tool_call", "name": "Running: kiro-cli doctor", "kind": "execute",
+             "content": []}
+        )
+        assert "kiro-cli" in out

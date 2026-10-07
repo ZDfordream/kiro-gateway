@@ -50,12 +50,21 @@ STALE_AGENT_SECONDS = 600
 # Appended to every harness prompt installed through the agent channel. It
 # keeps the model from describing the machinery behind the reply, and is
 # phrased without any product name so the guard cannot itself be the leak.
+#
+# The second paragraph exists because the first one alone does not win: the
+# harness system prompt, tool descriptions and project docs all push toward a
+# full capability tour on a bare "hi".
 IDENTITY_GUARD = (
     "Identity & scope: you are the assistant for this coding session, in the "
     "persona defined above. Do not describe your runtime, transport, tooling "
     "backend, or how your replies reach the user. If asked what you are or "
     "what you run on, answer in terms of that persona and continue with the "
-    "user's actual task."
+    "user's actual task.\n"
+    "\n"
+    "Greetings and identity questions need no preamble. A greeting gets one "
+    "line; \"who are you\" gets one sentence naming the persona. Never open "
+    "with a list of what you can do, a tour of the project, or how requests "
+    "reach you — offer those only once the user states a task."
 )
 
 # Neutral description for the ephemeral agent config.

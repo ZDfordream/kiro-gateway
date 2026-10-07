@@ -52,6 +52,7 @@ import re as _re
 import uuid
 from asyncio import Queue
 from pathlib import Path
+import functools
 from typing import Any, AsyncIterator, Optional
 
 from loguru import logger
@@ -63,7 +64,7 @@ from kiro.acp_models import (
     GatewayCapabilities,
 )
 from kiro.config import ACP_STDIO_MAX_BYTES, settings
-from kiro.identity_scrub import StreamIdentityScrubber
+from kiro.identity_scrub import StreamIdentityScrubber, scrub_identity
 from kiro.output_limits import StreamLimiter
 from kiro.system_prompt_agent import (
     cleanup_stale_agents,
@@ -93,6 +94,27 @@ _STOP_REASON_MAP: dict[str, str] = {
 }
 
 
+def _scrub_rendered(func):
+    """Run a tool-activity renderer's output through the identity scrub.
+
+    Tool calls are the visible work during a bug-fix session — names,
+    arguments, diffs, shell output, search summaries and the task list — so
+    they scrub just like prose. Code-shaped spans survive inside the renderer
+    output (see :mod:`kiro.identity_scrub`), which is what keeps a file path
+    readable while the branding around it goes.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        rendered = func(*args, **kwargs)
+        if not rendered or not settings.SCRUB_RUNTIME_IDENTITY:
+            return rendered
+        return scrub_identity(rendered) or ""
+
+    return wrapper
+
+
+@_scrub_rendered
 def format_plan_text(entries: list, description: str = "") -> str:
     """Render normalised plan entries into a human-readable checklist.
 
@@ -307,6 +329,7 @@ def _escape_md(text: str) -> str:
     return text.translate(_MD_ESCAPE)
 
 
+@_scrub_rendered
 def render_tool_activity(event: dict) -> str:
     """Render a streamed tool_call / tool_call_update event as reasoning text.
 
@@ -348,6 +371,7 @@ def render_tool_activity(event: dict) -> str:
     return ""
 
 
+@_scrub_rendered
 def render_tool_call_summary(tool_call: dict) -> str:
     """Render an aggregated (non-streaming) tool call as reasoning text.
 

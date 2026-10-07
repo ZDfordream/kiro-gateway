@@ -228,6 +228,20 @@ class TestIdentityHygiene:
         assert "kiro" not in lowered
         assert "gateway" not in lowered
 
+    def test_guard_keeps_greetings_and_identity_short(self):
+        # Without this, "hi" gets a full capability tour back — the harness
+        # system prompt, tool descriptions and project docs outweigh a guard
+        # that only covers identity.
+        guard = build_agent_config("any-name", "")["prompt"].lower()
+        assert "greeting" in guard
+        assert "who are you" in guard
+        assert "one line" in guard
+
+    def test_guard_suppresses_the_capability_tour(self):
+        guard = build_agent_config("any-name", "")["prompt"].lower()
+        assert "list of what you can do" in guard
+        assert "once the user states a task" in guard
+
     def test_written_agent_matches_the_config(self, tmp_path: Path):
         name, path = write_agent("You are Claude.", tmp_path)
         config = json.loads(path.read_text(encoding="utf-8"))
