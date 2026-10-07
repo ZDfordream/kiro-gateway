@@ -327,3 +327,65 @@ class TestStreamIdentityScrubber:
         stream = StreamIdentityScrubber(enabled=False)
         assert stream.push("kiro-cli") == "kiro-cli"
         assert stream.flush() == ""
+
+
+class TestStreamContextAcrossChunks:
+    """Generic words must see runtime context that arrived in an earlier chunk.
+
+    The generic layer only rewrites ``gateway`` / ``mcp`` when the sentence
+    already names the runtime — but in a stream the brand token can land in one
+    chunk and the generic word in the next, so a per-chunk scrub misses the
+    context and leaks the word.
+    """
+
+    def test_generic_word_rewrites_with_brand_from_an_earlier_chunk(self):
+        stream = StreamIdentityScrubber()
+        out = stream.push("The session is served by kiro-cli through a ")
+        out += stream.push("gateway on port 8001.")
+        out += stream.flush()
+        assert "kiro" not in out.lower()
+        assert "gateway" not in out.lower()
+        assert NEUTRAL_TOKEN in out
+
+    def test_uncontextual_word_still_survives_across_chunks(self):
+        # "gateway" with no runtime context anywhere is ordinary English —
+        # chunking must not make it rewrite-eligible.
+        stream = StreamIdentityScrubber()
+        out = stream.push("She works at the payment ")
+        out += stream.push("gateway downtown.")
+        out += stream.flush()
+        assert "gateway" in out
+
+
+class TestProductDotDirectory:
+    """The runtime's own hidden config dir is brand even inside code spans.
+
+    ``~/.kiro/skills/`` is not somebody's project layout — it is the product's
+    own footprint, so it is rewritten where ``kiro/acp_client.py`` (a user path)
+    must stay readable.
+    """
+
+    def test_dot_dir_in_a_path_is_rewritten(self):
+        assert (
+            scrub_identity("A local skills directory at ~/.kiro/skills/")
+            == f"A local skills directory at ~/.{NEUTRAL_TOKEN}/skills/"
+        )
+
+    def test_dot_dir_inside_backticks_is_rewritten(self):
+        assert (
+            scrub_identity("see `~/.kiro/settings/` for details")
+            == f"see `~/.{NEUTRAL_TOKEN}/settings/` for details"
+        )
+
+    def test_user_project_path_still_survives(self):
+        assert scrub_identity("Edit kiro/acp_client.py line 42") == (
+            "Edit kiro/acp_client.py line 42"
+        )
+
+    def test_dot_dir_survives_a_chunk_split(self):
+        stream = StreamIdentityScrubber()
+        out = stream.push("skills live in ~/.ki")
+        out += stream.push("ro/skills/ here")
+        out += stream.flush()
+        assert "kiro" not in out.lower()
+        assert f"~/.{NEUTRAL_TOKEN}/skills/" in out

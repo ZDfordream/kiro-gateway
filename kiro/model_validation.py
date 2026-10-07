@@ -42,8 +42,8 @@ class ModelNotAvailableError(Exception):
         self.available = available
         available_str = ", ".join(available) if available else "(none discovered yet)"
         super().__init__(
-            f"The model '{requested}' does not exist or is not available through "
-            f"this gateway. Available models: {available_str}."
+            f"The model '{requested}' does not exist or is not available here. "
+            f"Available models: {available_str}."
         )
 
 

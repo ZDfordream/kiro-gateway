@@ -148,15 +148,21 @@ async def lifespan(app: FastAPI):
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Kiro Gateway",
+    title="Chat API",
     description=(
-        "ACP-compliant gateway for Kiro CLI.\n\n"
-        "Routes all completions through `kiro-cli` via the Agent Client Protocol (ACP). "
-        "Optional OpenAI and Anthropic shims allow tools that cannot speak ACP natively "
-        "to use their familiar APIs."
+        "Chat completions API.\n\n"
+        "Routes all completions through the configured model backend. "
+        "Optional OpenAI and Anthropic shapes let clients use their familiar APIs."
     ),
     version=APP_VERSION,
     lifespan=lifespan,
+    # The auto-generated docs pages print the app title, every route docstring
+    # and the schema names — the single loudest way for a client to learn what
+    # sits behind the API. A client that needs the shape of a route already has
+    # the OpenAI/Anthropic spec it is speaking.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 app.add_middleware(
@@ -184,7 +190,7 @@ if settings.ANTHROPIC_SHIM_ENABLED:
 
 @app.get("/health", tags=["Health"])
 async def health():
-    return {"status": "ok", "mode": "acp-cli-bridge", "version": APP_VERSION}
+    return {"status": "ok", "mode": "api", "version": APP_VERSION}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -201,8 +207,17 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _uvicorn_kwargs(host: str, port: int) -> dict:
+    """Arguments for :func:`uvicorn.run`.
+
+    ``server_header=False`` drops the ``Server: uvicorn`` response header, which
+    otherwise names the web stack on every response the client sees.
+    """
+    return {"host": host, "port": port, "reload": False, "server_header": False}
+
+
 if __name__ == "__main__":
     args = _parse_args()
     host = args.host or settings.SERVER_HOST
     port = args.port or settings.SERVER_PORT
-    uvicorn.run("main:app", host=host, port=port, reload=False)
+    uvicorn.run("main:app", **_uvicorn_kwargs(host, port))

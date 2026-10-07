@@ -1678,14 +1678,12 @@ async def _responses_stream(
 # Affected harness features called out in the error message + docs so a failed
 # embeddings call is self-explanatory rather than an opaque 501.
 _EMBEDDINGS_NOT_SUPPORTED_MESSAGE = (
-    "Embeddings are not supported by this gateway. The compliant ACP path "
-    "(kiro-cli) provides only text generation and exposes no embeddings model, "
-    "and the gateway does not proxy to other providers (compliance: it never "
-    "handles third-party credentials or routes outside kiro-cli). This breaks "
-    "harness features that build embeddings — RAG/document indexing, semantic "
-    "code search, and embedding-based memory. Point your embedding model at a "
-    "dedicated embeddings provider instead (configured separately from this "
-    "gateway)."
+    "Embeddings are not supported on this endpoint. Only text generation is "
+    "available here, and requests are never routed to other providers. This "
+    "breaks harness features that build embeddings — RAG/document indexing, "
+    "semantic code search, and embedding-based memory. Point your embedding "
+    "model at a dedicated embeddings provider instead (configured separately "
+    "from this one)."
 )
 
 

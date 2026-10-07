@@ -31,6 +31,15 @@ from loguru import logger
 #: Every brand hit is rewritten to this. Deliberately generic and unbranded.
 NEUTRAL_TOKEN = "agent"
 
+#: The product's own hidden config home (``~/.kiro``, ``/home/me/.kiro/…``).
+#: Unlike a user's project layout — ``kiro/acp_client.py`` is somebody's real
+#: directory and stays readable — the dot-directory is the runtime's own
+#: footprint, so it is rewritten even inside a code-shaped span. A reply that
+#: names it hands the client the product name on a plate.
+_PRODUCT_DOT_DIR = re.compile(
+    r"(?<![A-Za-z0-9_.])\.kiro(?![A-Za-z0-9_])", re.IGNORECASE
+)
+
 #: Word characters plus ``_``. A brand token touching one of these is part of
 #: an identifier (``KiroGatewayError``, ``kiro_gateway``) and must not be cut.
 _BOUND = r"(?<![A-Za-z0-9_])"
@@ -198,19 +207,31 @@ def _sentence_bounds(text: str, position: int) -> tuple[int, int]:
     return start, end
 
 
-def _scrub_generic(text: str) -> str:
-    """Replace infrastructure words only where the sentence gives context."""
-    masked = _mask_protected(text)
-    spans = _protected_spans(text)
+def _scrub_generic(text: str, context: str = "") -> str:
+    """Replace infrastructure words only where the sentence gives context.
+
+    Args:
+        text: The text to rewrite.
+        context: Text that precedes *text* in the stream. Consulted for
+            sentence context only — never rewritten — so a brand token that
+            arrived in an earlier chunk still licenses rewriting a generic
+            word that arrives later in the same sentence.
+    """
+    if not text:
+        return text
+    combined = context + text
+    masked = _mask_protected(combined)
+    spans = _protected_spans(combined)
+    offset = len(context)
 
     def replace(match: re.Match[str]) -> str:
-        start, end = match.span()
+        start, end = match.start() + offset, match.end() + offset
         if _overlaps(spans, start, end):
             return match.group(0)
-        prefix = text[max(0, start - 24) : start]
+        prefix = combined[max(0, start - 24) : start]
         if _PRODUCT_PATTERN.search(prefix):
             return match.group(0)
-        lo, hi = _sentence_bounds(text, start)
+        lo, hi = _sentence_bounds(combined, start)
         return NEUTRAL_TOKEN if _CONTEXT_PATTERN.search(masked[lo:hi]) else match.group(0)
 
     return _GENERIC_PATTERN.sub(replace, text)
@@ -226,11 +247,13 @@ class IdentityScrubber:
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
 
-    def apply(self, text: str) -> str:
+    def apply(self, text: str, context: str = "") -> str:
         """Scrub brandings out of *text*.
 
         Args:
             text: Raw model output or passthrough error text.
+            context: Text already emitted before *text* (streaming only).
+                Consulted for sentence context, never rewritten.
 
         Returns:
             The scrubbed text (unchanged when the scrubber is disabled or the
@@ -238,7 +261,10 @@ class IdentityScrubber:
         """
         if not self.enabled or not text:
             return text
-        scrubbed = _scrub_generic(_scrub_brand(text))
+        # Pre-pass, before span protection: the runtime's own dot-directory is
+        # brand even when it sits inside a path or a backtick span.
+        text = _PRODUCT_DOT_DIR.sub("." + NEUTRAL_TOKEN, text)
+        scrubbed = _scrub_generic(_scrub_brand(text), context)
         if scrubbed != text:
             logger.debug(
                 f"Identity scrub rewrote a branding "
@@ -260,9 +286,13 @@ _DEFAULT_SCRUBBER = IdentityScrubber()
 #: the chance that `` agent`` follows, and a released banner fragment is
 #: cosmetic damage, not a leak. Articles are not candidates: the replacement
 #: is a bare noun, so an already-emitted ``the `` simply stands in front of it.
+#: ``.kiro`` is listed for the runtime's own dot-directory — without it the
+#: dot would ship in one chunk and the ``kiro`` in the next, and the rewrite
+#: would never see them together.
 _HOLDBACK_CANDIDATES: tuple[str, ...] = (
     "kiro gateway",
     "kiro cli",
+    ".kiro",
     "kiro",
     "gateway",
     "网关",
@@ -327,10 +357,15 @@ class StreamIdentityScrubber:
         enabled: When ``False`` chunks pass straight through with no holdback.
     """
 
+    #: How much already-emitted text to keep as sentence context for the
+    #: generic layer. Long enough to cover a sentence, cheap enough to hold.
+    _CONTEXT_TAIL = 300
+
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
         self._scrubber = IdentityScrubber(enabled=enabled)
         self._buffer = ""
+        self._tail = ""
 
     def push(self, chunk: str) -> str:
         """Accept the next chunk and return the text safe to emit now.
@@ -350,7 +385,9 @@ class StreamIdentityScrubber:
             released, self._buffer = self._buffer[:-hold], self._buffer[-hold:]
         else:
             released, self._buffer = self._buffer, ""
-        return self._scrubber.apply(released)
+        out = self._scrubber.apply(released, self._tail)
+        self._tail = (self._tail + out)[-self._CONTEXT_TAIL :]
+        return out
 
     def flush(self) -> str:
         """Drain whatever is still held and return it scrubbed.
@@ -359,7 +396,7 @@ class StreamIdentityScrubber:
             The scrubbed remainder (``""`` when nothing is held).
         """
         released, self._buffer = self._buffer, ""
-        return self._scrubber.apply(released) if self.enabled else ""
+        return self._scrubber.apply(released, self._tail) if self.enabled else ""
 
 
 def scrub_identity(text: str | None) -> str | None:

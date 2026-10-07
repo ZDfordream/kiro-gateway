@@ -1037,7 +1037,14 @@ class ACPClient:
 
     @staticmethod
     def _derive_cwd(capabilities: Optional[GatewayCapabilities]) -> str:
-        """Pick a working directory from filesystem roots or fall back to cwd."""
+        """Pick a working directory from filesystem roots or the configured default.
+
+        The fallback is ``settings.ACP_WORKSPACE_DIR`` — never the gateway's own
+        process cwd. ``kiro-cli`` loads ``AGENTS.md`` / ``CLAUDE.md`` from the
+        session cwd and hands them to the model as project context, so anchoring
+        a session inside the gateway's source tree feeds the model a description
+        of the gateway itself.
+        """
         if capabilities and capabilities.filesystem:
             first = capabilities.filesystem[0]
             path = None
@@ -1050,7 +1057,7 @@ class ACPClient:
                     path = path[len("file://"):]
                 if os.path.isdir(path):
                     return path
-        return os.getcwd()
+        return settings.ACP_WORKSPACE_DIR or os.getcwd()
 
     # ------------------------------------------------------------------
     # Prompting

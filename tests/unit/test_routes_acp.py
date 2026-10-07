@@ -15,12 +15,12 @@ ACT_HEADERS = {"Content-Type": "application/json"}
 # ---------------------------------------------------------------------------
 
 def test_health_endpoint(sync_client):
-    """GET /health returns status ok and acp-cli-bridge mode."""
+    """GET /health returns status ok and a mode value that names nothing."""
     response = sync_client.get("/health")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["mode"] == "acp-cli-bridge"
+    assert data["mode"] == "api"
 
 
 # ---------------------------------------------------------------------------
