@@ -85,9 +85,9 @@ async def acp_chat(
     # the usage object (the streaming ACP route mirrors it automatically via
     # the "done" event). Present only when non-empty.
     usage = dict(result.get("usage", {}) or {})
-    kiro_metadata = result.get("metadata") or {}
-    if kiro_metadata:
-        usage["kiro_metadata"] = kiro_metadata
+    extended_usage = result.get("metadata") or {}
+    if extended_usage:
+        usage["extended_usage"] = extended_usage
 
     return ACPChatResponse(
         session_id="",

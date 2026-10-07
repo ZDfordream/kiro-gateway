@@ -511,9 +511,9 @@ async def chat_completions(
     # Additive: any real usage/cost/context metadata kiro-cli reported (credits,
     # context %, turn duration, v3 token breakdown). Present only when non-empty
     # so the native usage shape is unchanged when kiro-cli reports nothing.
-    kiro_metadata = result.get("metadata") or {}
-    if kiro_metadata:
-        usage_obj["kiro_metadata"] = kiro_metadata
+    extended_usage = result.get("metadata") or {}
+    if extended_usage:
+        usage_obj["extended_usage"] = extended_usage
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -693,9 +693,9 @@ async def _stream_response(
                             "cached_tokens": usage["cache_read_input_tokens"],
                         },
                     }
-                    kiro_metadata = event.get("metadata") or {}
-                    if kiro_metadata:
-                        usage_chunk["kiro_metadata"] = kiro_metadata
+                    extended_usage = event.get("metadata") or {}
+                    if extended_usage:
+                        usage_chunk["extended_usage"] = extended_usage
                     yield (
                         "data: "
                         + json.dumps({
@@ -1155,7 +1155,7 @@ def _build_response_object(
         },
     }
     if metadata:
-        usage_obj["kiro_metadata"] = metadata
+        usage_obj["extended_usage"] = metadata
     return {
         "id": response_id,
         "object": "response",

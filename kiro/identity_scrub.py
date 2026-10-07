@@ -29,34 +29,29 @@ import re
 from loguru import logger
 
 #: Every brand hit is rewritten to this. Deliberately generic and unbranded.
-NEUTRAL_TOKEN = "the agent"
+NEUTRAL_TOKEN = "agent"
 
 #: Word characters plus ``_``. A brand token touching one of these is part of
 #: an identifier (``KiroGatewayError``, ``kiro_gateway``) and must not be cut.
 _BOUND = r"(?<![A-Za-z0-9_])"
 _END = r"(?![A-Za-z0-9_])"
 
-#: A leading article is consumed with the brand token so "the kiro-gateway
-#: project" becomes "the <token> project" rather than "the the <token> project".
-#: The word boundary on the article keeps "man kiro-cli" from eating "man".
-_ARTICLE = r"(?:\b(?:the|a|an)\s+)?"
-
 # Longest first: the CLI banner must be consumed before the shorter CLI form,
 # or "Kiro CLI Agent v2.26.1" would degrade to "<token> Agent v2.26.1".
 _BRAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        _ARTICLE + _BOUND + r"kiro[\s_-]*cli[\s_-]*agent(?:\s+v?\d[\w.\-]*)?" + _END,
+        _BOUND + r"kiro[\s_-]*cli[\s_-]*agent(?:\s+v?\d[\w.\-]*)?" + _END,
         re.IGNORECASE,
     ),
     # The banner without the product name, identifiable by its version marker.
     # The version is required — a bare "CLI agent" is ordinary prose.
     re.compile(
-        _ARTICLE + _BOUND + r"cli[\s_-]*agent\s+v?\d[\w.\-]*" + _END,
+        _BOUND + r"cli[\s_-]*agent\s+v?\d[\w.\-]*" + _END,
         re.IGNORECASE,
     ),
-    re.compile(_ARTICLE + _BOUND + r"kiro[\s_-]*gateway" + _END, re.IGNORECASE),
-    re.compile(_ARTICLE + _BOUND + r"kiro[\s_-]*cli" + _END, re.IGNORECASE),
-    re.compile(_ARTICLE + _BOUND + r"kiro" + _END, re.IGNORECASE),
+    re.compile(_BOUND + r"kiro[\s_-]*gateway" + _END, re.IGNORECASE),
+    re.compile(_BOUND + r"kiro[\s_-]*cli" + _END, re.IGNORECASE),
+    re.compile(_BOUND + r"kiro" + _END, re.IGNORECASE),
 )
 
 # Code-shaped spans, matched leftmost and never rewritten. Quotes and
@@ -75,13 +70,13 @@ _PROTECTED_ALWAYS = re.compile(
 #: swallow the rest of the reply into a protected region.
 _PROTECTED_INLINE_CODE = re.compile(r"`[^`\n]*`")
 
-#: Infrastructure vocabulary, replaced only with runtime context. A leading
-#: article is swallowed so "the gateway" becomes the token, not "the <token>".
+#: Infrastructure vocabulary, replaced only with runtime context. The token is
+#: a bare noun, so any leading article is left alone — "the gateway" becomes
+#: "the <token>", and a chunk boundary between the two can no longer double it.
 #: Boundaries are ASCII-aware rather than ``\b``: CJK glyphs are word
 #: characters, so ``\b`` never fires between 汉字 and would block 网关/代理.
 _GENERIC_PATTERN = re.compile(
-    _ARTICLE
-    + _BOUND
+    _BOUND
     + r"(?:"
     r"gateway|网关|"
     r"mcp|acp|"
@@ -263,15 +258,12 @@ _DEFAULT_SCRUBBER = IdentityScrubber()
 #: Literal phrases a held tail may grow into. The ``kiro cli agent`` banner is
 #: deliberately absent: holding for it would stall every ``kiro-cli`` delta on
 #: the chance that `` agent`` follows, and a released banner fragment is
-#: cosmetic damage, not a leak. The article-led phrases are present so ``the ``
-#: is never emitted before the token is recognised — otherwise the article
-#: survives to collide with the replacement.
+#: cosmetic damage, not a leak. Articles are not candidates: the replacement
+#: is a bare noun, so an already-emitted ``the `` simply stands in front of it.
 _HOLDBACK_CANDIDATES: tuple[str, ...] = (
     "kiro gateway",
     "kiro cli",
     "kiro",
-    "the gateway",
-    "a gateway",
     "gateway",
     "网关",
 )

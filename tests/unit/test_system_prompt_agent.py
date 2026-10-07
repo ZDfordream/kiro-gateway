@@ -12,6 +12,8 @@ from kiro.acp_models import PromptMessage
 from kiro.config import _parse_system_prompt_channel
 from kiro.system_prompt_agent import (
     EPHEMERAL_AGENT_PREFIX,
+    IDENTITY_GUARD,
+    append_identity_guard,
     build_agent_config,
     cleanup_stale_agents,
     is_ephemeral_agent,
@@ -242,9 +244,81 @@ class TestIdentityHygiene:
         assert "list of what you can do" in guard
         assert "once the user states a task" in guard
 
+    def test_guard_forbids_describing_the_layer_behind_the_reply(self):
+        # "backed by X", "behind the gateway", "the official Y binary" all
+        # advertise that something sits between the user and the model. The
+        # guard has to forbid the shape, not just the product name.
+        guard = build_agent_config("any-name", "")["prompt"].lower()
+        assert "architecture" in guard
+        assert "backs" in guard or "backed" in guard
+        assert "proxy" in guard or "relays" in guard
+
+    def test_guard_forbids_volunteering_project_context(self):
+        # Naming the host project on a greeting is the giveaway: the user is
+        # in some repo and suddenly hears about another one.
+        guard = build_agent_config("any-name", "")["prompt"].lower()
+        assert "project context" in guard
+        assert "only when" in guard
+
     def test_written_agent_matches_the_config(self, tmp_path: Path):
         name, path = write_agent("You are Claude.", tmp_path)
         config = json.loads(path.read_text(encoding="utf-8"))
         assert config == build_agent_config(name, "You are Claude.")
         assert "kiro" not in name.lower()
         assert "gateway" not in name.lower()
+
+
+class TestInlineIdentityGuard:
+    """The guard must reach the model on the ``System:`` label path too.
+
+    The agent channel carries it as part of the agent prompt. When the prompt
+    is only a label inside the turn — KIRO_SYSTEM_PROMPT=inline, or a
+    configured persona — nothing else attaches the guard, and the model is
+    free to describe the layer behind it.
+    """
+
+    def test_guard_is_appended_to_the_leading_system_message(self):
+        messages = [PromptMessage(role="system", content="You are Claude.")]
+
+        out = append_identity_guard(messages)
+
+        assert out[0].content == f"You are Claude.\n\n{IDENTITY_GUARD}"
+        assert out[0].role == "system"
+
+    def test_developer_message_is_eligible(self):
+        messages = [{"role": "developer", "content": "sandbox: read-only"}]
+
+        out = append_identity_guard(messages)
+
+        assert out[0]["content"] == f"sandbox: read-only\n\n{IDENTITY_GUARD}"
+
+    def test_later_messages_are_untouched(self):
+        messages = [
+            PromptMessage(role="system", content="S"),
+            PromptMessage(role="user", content="hi"),
+        ]
+
+        out = append_identity_guard(messages)
+
+        assert out[1].content == "hi"
+        assert IDENTITY_GUARD not in out[1].content
+
+    def test_non_system_leading_message_is_left_alone(self):
+        messages = [PromptMessage(role="user", content="hi")]
+
+        out = append_identity_guard(messages)
+
+        assert out[0].content == "hi"
+
+    def test_guard_is_not_duplicated(self):
+        once = append_identity_guard([PromptMessage(role="system", content="S")])
+        twice = append_identity_guard(once)
+
+        assert twice[0].content.count(IDENTITY_GUARD) == 1
+
+    def test_original_list_is_not_mutated(self):
+        messages = [PromptMessage(role="system", content="S")]
+
+        append_identity_guard(messages)
+
+        assert messages[0].content == "S"

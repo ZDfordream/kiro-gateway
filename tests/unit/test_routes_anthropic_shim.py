@@ -1762,7 +1762,7 @@ class TestAnthropicShimToolActivityReasoning:
 # ---------------------------------------------------------------------------
 
 class _AnthropicMetadataShim:
-    """ShimService stand-in whose result carries kiro_metadata."""
+    """ShimService stand-in whose result carries extended_usage."""
 
     _META = {"credits": 0.17, "context_usage_percentage": 1.87, "turn_duration_ms": 4673}
 
@@ -1784,7 +1784,7 @@ class _AnthropicMetadataShim:
 
 
 class TestAnthropicMetadataSurfacing:
-    """usage.kiro_metadata is surfaced additively in both modes."""
+    """usage.extended_usage is surfaced additively in both modes."""
 
     def test_messages_non_stream_surfaces_metadata(self, sync_client, anthropic_headers):
         sync_client.app.state.shim_service = _AnthropicMetadataShim()
@@ -1800,7 +1800,7 @@ class TestAnthropicMetadataSurfacing:
         assert usage["output_tokens"] == 3
         assert usage["cache_read_input_tokens"] == 0
         # Metadata surfaced additively.
-        assert usage["kiro_metadata"]["credits"] == pytest.approx(0.17)
+        assert usage["extended_usage"]["credits"] == pytest.approx(0.17)
 
     def test_messages_stream_surfaces_metadata_in_message_delta(self, sync_client, anthropic_headers):
         sync_client.app.state.shim_service = _AnthropicMetadataShim()
@@ -1818,7 +1818,7 @@ class TestAnthropicMetadataSurfacing:
         ]
         message_deltas = [d for d in deltas if d.get("type") == "message_delta"]
         assert message_deltas, "expected a message_delta event"
-        assert message_deltas[-1]["usage"]["kiro_metadata"]["credits"] == pytest.approx(0.17)
+        assert message_deltas[-1]["usage"]["extended_usage"]["credits"] == pytest.approx(0.17)
 
 
 # ---------------------------------------------------------------------------
@@ -2017,3 +2017,45 @@ class TestAnthropicShimKeepalive:
         assert resp.status_code == 200
         assert resp.text.count("event: ping") == 1
         assert "event: message_stop" in resp.text
+
+
+class TestResponseNeverNamesTheRuntime:
+    """A client must not be able to tell there is anything between it and the model.
+
+    Every response body — including the additive usage metadata — has to be
+    free of the runtime's name. A field called ``extended_usage`` is a bigger
+    giveaway than anything the model says.
+    """
+
+    _META = {"credits": 0.17, "turn_duration_ms": 4673}
+
+    @staticmethod
+    def _assert_unbranded(payload: object) -> None:
+        blob = json.dumps(payload).lower()
+        assert "kiro" not in blob, payload
+
+    def test_non_stream_body_is_unbranded(self, sync_client, anthropic_headers):
+        sync_client.app.state.shim_service = _AnthropicMetadataShim()
+        resp = sync_client.post("/v1/messages", headers=anthropic_headers, json={
+            "model": "claude-sonnet-4.6",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        self._assert_unbranded(resp.json())
+
+    def test_stream_body_is_unbranded(self, sync_client, anthropic_headers):
+        sync_client.app.state.shim_service = _AnthropicMetadataShim()
+        resp = sync_client.post("/v1/messages", headers=anthropic_headers, json={
+            "model": "claude-sonnet-4.6",
+            "max_tokens": 64,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        self._assert_unbranded(resp.text)
+
+    def test_models_listing_is_unbranded(self, sync_client, anthropic_headers):
+        resp = sync_client.get("/v1/models", headers=anthropic_headers)
+        assert resp.status_code == 200
+        self._assert_unbranded(resp.json())

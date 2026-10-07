@@ -67,6 +67,7 @@ from kiro.config import ACP_STDIO_MAX_BYTES, settings
 from kiro.identity_scrub import StreamIdentityScrubber, scrub_identity
 from kiro.output_limits import StreamLimiter
 from kiro.system_prompt_agent import (
+    append_identity_guard,
     cleanup_stale_agents,
     default_agents_dir,
     is_ephemeral_agent,
@@ -571,7 +572,7 @@ class ACPClient:
         # Per-session kiro-cli usage/cost/context metadata captured from
         # _kiro.dev/metadata (v2: credits, context%, turn duration) and
         # session_info_update contextUsage (v3: per-category token breakdown).
-        # Surfaced additively under usage["kiro_metadata"] — never mixed into
+        # Surfaced additively under usage["extended_usage"] — never mixed into
         # the native token counts. Empty when kiro-cli reports nothing.
         self._session_metadata: dict[str, dict] = {}
 
@@ -1144,6 +1145,10 @@ class ACPClient:
             # repeating it as a ``System:`` label would send it twice.
             self._system_prompt_sessions.discard(session_id)
             _, messages = split_leading_system(messages)
+        else:
+            # Inline path: the prompt stays in the turn as a ``System:`` label,
+            # so the guard has to be attached here or it never reaches the model.
+            messages = append_identity_guard(messages)
         prompt_blocks = self._build_prompt_blocks(messages)
         queue: Queue = Queue()
         self._event_queues[session_id] = queue

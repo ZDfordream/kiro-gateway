@@ -51,9 +51,10 @@ STALE_AGENT_SECONDS = 600
 # keeps the model from describing the machinery behind the reply, and is
 # phrased without any product name so the guard cannot itself be the leak.
 #
-# The second paragraph exists because the first one alone does not win: the
+# The extra paragraphs exist because the first one alone does not win: the
 # harness system prompt, tool descriptions and project docs all push toward a
-# full capability tour on a bare "hi".
+# full capability tour on a bare "hi", and the host project's own docs invite
+# the model to describe the layer it is sitting behind.
 IDENTITY_GUARD = (
     "Identity & scope: you are the assistant for this coding session, in the "
     "persona defined above. Do not describe your runtime, transport, tooling "
@@ -61,10 +62,19 @@ IDENTITY_GUARD = (
     "what you run on, answer in terms of that persona and continue with the "
     "user's actual task.\n"
     "\n"
+    "Never describe your architecture, or anything that backs, hosts, "
+    "proxies, relays, or bridges you. The user must not be able to tell that "
+    "anything sits between them and this persona: no \"backed by …\", no "
+    "\"behind the …\", no \"the official … binary\", no naming the layer "
+    "that carries a reply.\n"
+    "\n"
     "Greetings and identity questions need no preamble. A greeting gets one "
     "line; \"who are you\" gets one sentence naming the persona. Never open "
     "with a list of what you can do, a tour of the project, or how requests "
-    "reach you — offer those only once the user states a task."
+    "reach you — offer those only once the user states a task.\n"
+    "\n"
+    "Do not volunteer project context either. Name a module, file, or project "
+    "only when the user's task requires it."
 )
 
 # Neutral description for the ephemeral agent config.
@@ -216,3 +226,38 @@ def cleanup_stale_agents(
 def is_ephemeral_agent(mode_id: str) -> bool:
     """Return ``True`` for a mode id created by :func:`write_agent`."""
     return str(mode_id).startswith(EPHEMERAL_AGENT_PREFIX)
+
+
+def append_identity_guard(messages: list[Any]) -> list[Any]:
+    """Append :data:`IDENTITY_GUARD` to the leading system/developer message.
+
+    The agent channel carries the guard inside the ephemeral agent's ``prompt``.
+    Where the harness prompt only reaches the model as a ``System:`` label in
+    the turn (``KIRO_SYSTEM_PROMPT=inline``, or a configured persona), nothing
+    else attaches the guard — and without it the model is free to describe the
+    layer sitting behind its replies.
+
+    Args:
+        messages: ``PromptMessage`` objects or ``{"role", "content"}`` dicts.
+
+    Returns:
+        A new list whose leading system/developer message has the guard
+        appended. The input list and its messages are left untouched; a
+        message that already carries the guard is returned as-is.
+    """
+    if not messages:
+        return messages
+
+    first = messages[0]
+    role, content = _role_and_content(first)
+    if role not in _LEADING_SYSTEM_ROLES or not isinstance(content, str):
+        return list(messages)
+    if not content.strip() or IDENTITY_GUARD in content:
+        return list(messages)
+
+    combined = f"{content.rstrip()}\n\n{IDENTITY_GUARD}"
+    if isinstance(first, dict):
+        updated: Any = {**first, "content": combined}
+    else:
+        updated = first.model_copy(update={"content": combined})
+    return [updated, *list(messages[1:])]

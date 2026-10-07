@@ -2357,7 +2357,7 @@ class TestPromptStreamLimiting:
 # new_session installs the prompt as a custom agent's ``prompt`` instead.
 # ---------------------------------------------------------------------------
 
-from kiro.system_prompt_agent import EPHEMERAL_AGENT_PREFIX  # noqa: E402
+from kiro.system_prompt_agent import EPHEMERAL_AGENT_PREFIX, IDENTITY_GUARD  # noqa: E402
 
 # Captured at import, before the session-scoped ``test_client`` fixture patches
 # ACPClient.start for the whole session.
@@ -2519,7 +2519,11 @@ class TestSystemPromptAgentFallback:
         assert session_id not in client._system_prompt_sessions
         assert list(agents_dir.iterdir()) == []
         text = await _prompt_text(client, session_id, _CONVERSATION)
-        assert text == f"System: {_SYSTEM}\n\nUser: Who are you?"
+        # Kept as a System: label, with the guard appended — the inline path
+        # has no agent prompt to carry it.
+        assert text == (
+            f"System: {_SYSTEM}\n\n{IDENTITY_GUARD}\n\nUser: Who are you?"
+        )
 
     @pytest.mark.asyncio
     async def test_session_new_failure_removes_agent_file(self, tmp_path):
@@ -2592,7 +2596,9 @@ class TestSystemPromptAgentSkipped:
 
         text = await _prompt_text(client, "never-installed", _CONVERSATION)
 
-        assert text == f"System: {_SYSTEM}\n\nUser: Who are you?"
+        assert text == (
+            f"System: {_SYSTEM}\n\n{IDENTITY_GUARD}\n\nUser: Who are you?"
+        )
 
 
 class TestStaleAgentCleanupOnStart:
@@ -2798,3 +2804,52 @@ class TestToolActivityIdentityScrub:
              "content": []}
         )
         assert "kiro-cli" in out
+
+
+class TestInlineIdentityGuardWiring:
+    """The guard must reach the model even when no agent prompt is used."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_blocks_carry_the_guard_without_an_agent(self):
+        from kiro.system_prompt_agent import IDENTITY_GUARD
+
+        client = ACPClient()
+        written: list[str] = []
+
+        async def fake_write_line(line: str) -> None:
+            written.append(line)
+
+        client._write_line = fake_write_line  # type: ignore[assignment]
+        params = PromptParams(
+            session_id="s-guard-1",
+            messages=[
+                PromptMessage(role="system", content="You are Claude."),
+                PromptMessage(role="user", content="hi"),
+            ],
+        )
+        # Not registered as a system-prompt session: this is the inline path.
+        gen = _REAL_PROMPT_STREAM(client, params)
+        feeder = asyncio.create_task(self._drive_until_queue(
+            client, "s-guard-1",
+            [{"type": "done", "finish_reason": "stop", "usage": {}}],
+        ))
+        got = [e async for e in gen]
+        await feeder
+
+        assert got and got[-1]["type"] == "done"
+        # Decode the wire payload: IDENTITY_GUARD contains quotes and newlines
+        # that the JSON encoding escapes.
+        sent = json.loads(written[0])["params"]["prompt"][0]["text"]
+        assert "You are Claude." in sent
+        assert IDENTITY_GUARD in sent
+
+    @staticmethod
+    async def _drive_until_queue(client, session_id, events):
+        for _ in range(1000):
+            queue = client._event_queues.get(session_id)
+            if queue is not None:
+                for event in events:
+                    queue.put_nowait(event)
+                return
+            await asyncio.sleep(0)
+        raise AssertionError(f"queue for {session_id} never appeared")

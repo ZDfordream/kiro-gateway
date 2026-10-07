@@ -66,16 +66,26 @@ class TestBrandLayer:
     def test_adjacent_punctuation_is_kept(self):
         assert scrub_identity("(kiro-cli)") == f"({NEUTRAL_TOKEN})"
 
-    def test_preceding_article_is_swallowed(self):
-        # Otherwise "the kiro-gateway project" reads as "the the <token> project".
+    def test_preceding_article_is_kept(self):
+        # The replacement is a bare noun, so the source article stays put and
+        # the phrase keeps its shape: "the kiro-gateway project" -> "the agent
+        # project", never "the the agent project".
         assert (
             scrub_identity("the kiro-gateway project")
-            == f"{NEUTRAL_TOKEN} project"
+            == f"the {NEUTRAL_TOKEN} project"
         )
 
-    def test_article_swallow_does_not_eat_the_previous_word(self):
-        # "man kiro-cli" must not eat into "man" — the article needs its
-        # own word boundary.
+    def test_stream_split_cannot_double_the_article(self):
+        # Regression: the holdback used to release "the " before the brand
+        # token was recognised, so a chunk boundary there produced
+        # "the the <token>".
+        stream = StreamIdentityScrubber()
+        first = stream.push("help you with the ")
+        second = stream.push("kiro-gateway project?")
+        assert first + second == f"help you with the {NEUTRAL_TOKEN} project?"
+
+    def test_preceding_word_is_not_eaten(self):
+        # "man kiro-cli" must not eat into "man".
         assert scrub_identity("man kiro-cli") == f"man {NEUTRAL_TOKEN}"
 
     def test_internal_identifiers_are_not_split(self):
@@ -94,7 +104,7 @@ class TestGenericLayer:
     def test_scrubs_gateway_when_sentence_has_brand_context(self):
         assert (
             scrub_identity("the request goes through the gateway to kiro-cli")
-            == f"the request goes through {NEUTRAL_TOKEN} to {NEUTRAL_TOKEN}"
+            == f"the request goes through the {NEUTRAL_TOKEN} to {NEUTRAL_TOKEN}"
         )
 
     def test_scrubs_gateway_when_sentence_names_the_runtime(self):
@@ -102,8 +112,8 @@ class TestGenericLayer:
         # are not, so they are only rewritten once something unmistakable
         # appears in the sentence.
         assert (
-            scrub_identity("the runtime is a gateway over stdio")
-            == f"the runtime is {NEUTRAL_TOKEN} over {NEUTRAL_TOKEN}"
+            scrub_identity("the runtime is behind the gateway over stdio")
+            == f"the runtime is behind the {NEUTRAL_TOKEN} over {NEUTRAL_TOKEN}"
         )
 
     def test_scrubs_chinese_gateway_with_context(self):
@@ -156,9 +166,10 @@ class TestFalsePositives:
         assert "gateway" not in scrub_identity(text)
 
     def test_agent_banner_without_the_product_name_is_scrubbed(self):
+        # The source article is kept, so the phrase still reads naturally.
         assert (
             scrub_identity("the CLI Agent v2.26.1 answered")
-            == f"{NEUTRAL_TOKEN} answered"
+            == f"the {NEUTRAL_TOKEN} answered"
         )
 
     def test_generic_cli_agent_phrase_is_preserved(self):
@@ -193,7 +204,7 @@ class TestProtectedSpans:
     def test_prose_still_gets_rewritten(self):
         assert (
             scrub_identity("I'm Kiro, behind the gateway")
-            == f"I'm {NEUTRAL_TOKEN}, behind {NEUTRAL_TOKEN}"
+            == f"I'm {NEUTRAL_TOKEN}, behind the {NEUTRAL_TOKEN}"
         )
 
     def test_a_protected_span_is_not_a_context_signal(self):
@@ -246,12 +257,12 @@ class TestWiderTermList:
     def test_contextual_mcp_and_transport_are_rewritten(self):
         assert scrub_identity(
             "kiro-cli registers the MCP servers over the transport"
-        ) == f"{NEUTRAL_TOKEN} registers {NEUTRAL_TOKEN} servers over {NEUTRAL_TOKEN}"
+        ) == f"{NEUTRAL_TOKEN} registers the {NEUTRAL_TOKEN} servers over the {NEUTRAL_TOKEN}"
 
     def test_contextual_subprocess_chain_is_rewritten(self):
         assert scrub_identity(
             "the gateway calls the subprocess, backed by kiro-cli"
-        ) == f"{NEUTRAL_TOKEN} calls {NEUTRAL_TOKEN}, backed by {NEUTRAL_TOKEN}"
+        ) == f"the {NEUTRAL_TOKEN} calls the {NEUTRAL_TOKEN}, backed by {NEUTRAL_TOKEN}"
 
     def test_contextual_chinese_proxy_is_rewritten(self):
         assert scrub_identity(
@@ -305,7 +316,7 @@ class TestStreamIdentityScrubber:
         stream = StreamIdentityScrubber()
         first = stream.push("via the gate")
         second = stream.push("way to kiro-cli")
-        assert first + second == f"via {NEUTRAL_TOKEN} to {NEUTRAL_TOKEN}"
+        assert first + second == f"via the {NEUTRAL_TOKEN} to {NEUTRAL_TOKEN}"
 
     def test_flush_returns_the_held_remainder(self):
         stream = StreamIdentityScrubber()

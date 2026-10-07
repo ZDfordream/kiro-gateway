@@ -572,9 +572,9 @@ async def create_message(
     # Additive: real usage/cost/context metadata kiro-cli reported (credits,
     # context %, turn duration, v3 token breakdown). Present only when non-empty
     # so the native usage shape is unchanged when kiro-cli reports nothing.
-    kiro_metadata = result.get("metadata") or {}
-    if kiro_metadata:
-        usage_obj["kiro_metadata"] = kiro_metadata
+    extended_usage = result.get("metadata") or {}
+    if extended_usage:
+        usage_obj["extended_usage"] = extended_usage
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:12]}",
@@ -807,7 +807,7 @@ async def _stream_response(
                         "output_tokens": output_usage["output_tokens"],
                         # Additive: real usage/cost/context metadata kiro-cli
                         # reported. Omitted when empty (native shape unchanged).
-                        **({"kiro_metadata": event["metadata"]} if event.get("metadata") else {}),
+                        **({"extended_usage": event["metadata"]} if event.get("metadata") else {}),
                     },
                 })
                 yield sse("message_stop", {"type": "message_stop"})

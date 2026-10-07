@@ -1893,11 +1893,11 @@ class TestOpenAIShimDiffAndShell:
 
 # ---------------------------------------------------------------------------
 # kiro usage/cost/context metadata surfacing (issue #56): when kiro-cli reports
-# metadata it appears additively under usage.kiro_metadata; otherwise absent.
+# metadata it appears additively under usage.extended_usage; otherwise absent.
 # ---------------------------------------------------------------------------
 
 class _MetadataShim:
-    """ShimService stand-in whose result carries kiro_metadata."""
+    """ShimService stand-in whose result carries extended_usage."""
 
     _META = {"credits": 0.17, "context_usage_percentage": 1.87, "turn_duration_ms": 4673}
 
@@ -1929,7 +1929,7 @@ class _NoMetadataShim(_MetadataShim):
 
 
 class TestOpenAIMetadataSurfacing:
-    """usage.kiro_metadata is surfaced additively in both modes."""
+    """usage.extended_usage is surfaced additively in both modes."""
 
     def test_chat_non_stream_surfaces_metadata(self, sync_client, openai_headers):
         sync_client.app.state.shim_service = _MetadataShim()
@@ -1943,8 +1943,8 @@ class TestOpenAIMetadataSurfacing:
         assert usage["prompt_tokens"] == 5
         assert usage["completion_tokens"] == 3
         # Metadata surfaced additively.
-        assert usage["kiro_metadata"]["credits"] == pytest.approx(0.17)
-        assert usage["kiro_metadata"]["turn_duration_ms"] == 4673
+        assert usage["extended_usage"]["credits"] == pytest.approx(0.17)
+        assert usage["extended_usage"]["turn_duration_ms"] == 4673
 
     def test_chat_non_stream_no_metadata_key_when_empty(self, sync_client, openai_headers):
         sync_client.app.state.shim_service = _NoMetadataShim()
@@ -1953,7 +1953,7 @@ class TestOpenAIMetadataSurfacing:
             "messages": [{"role": "user", "content": "hi"}],
         })
         assert resp.status_code == 200
-        assert "kiro_metadata" not in resp.json()["usage"]
+        assert "extended_usage" not in resp.json()["usage"]
 
     def test_chat_stream_surfaces_metadata_in_usage_chunk(self, sync_client, openai_headers):
         sync_client.app.state.shim_service = _MetadataShim()
@@ -1971,7 +1971,7 @@ class TestOpenAIMetadataSurfacing:
             and json.loads(line[len("data: "):]).get("usage")
         ]
         assert usage_chunks, "expected a usage-only chunk"
-        assert usage_chunks[-1]["usage"]["kiro_metadata"]["credits"] == pytest.approx(0.17)
+        assert usage_chunks[-1]["usage"]["extended_usage"]["credits"] == pytest.approx(0.17)
 
 
 # ---------------------------------------------------------------------------
@@ -2683,3 +2683,38 @@ class TestResponsesExecutedToolEchoRoute:
         assert resp.status_code == 200
         rendered = _rendered(rec.complete_kwargs[0]["messages"])
         assert rendered[-1] == ("user", "[tool_result id=call_x]\n42")
+
+
+class TestResponseNeverNamesTheRuntime:
+    """Same invariant as the Anthropic shim: no "kiro" anywhere in the body."""
+
+    _META = {"credits": 0.17, "turn_duration_ms": 4673}
+
+    @staticmethod
+    def _assert_unbranded(payload: object) -> None:
+        blob = json.dumps(payload).lower()
+        assert "kiro" not in blob, payload
+
+    def test_non_stream_body_is_unbranded(self, sync_client, openai_headers):
+        sync_client.app.state.shim_service = _MetadataShim()
+        resp = sync_client.post("/v1/chat/completions", headers=openai_headers, json={
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        self._assert_unbranded(resp.json())
+
+    def test_stream_body_is_unbranded(self, sync_client, openai_headers):
+        sync_client.app.state.shim_service = _MetadataShim()
+        resp = sync_client.post("/v1/chat/completions", headers=openai_headers, json={
+            "model": "claude-sonnet-4.6",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        self._assert_unbranded(resp.text)
+
+    def test_models_listing_is_unbranded(self, sync_client, openai_headers):
+        resp = sync_client.get("/v1/models", headers=openai_headers)
+        assert resp.status_code == 200
+        self._assert_unbranded(resp.json())
