@@ -715,3 +715,61 @@ class TestSurfaceToolCallsMapping:
         ))
         tool_events = [e for e in events if e.get("type") == "tool_call"]
         assert tool_events and tool_events[0]["name"] == "Read"
+
+
+# ---------------------------------------------------------------------------
+# Harness system prompt → ACPClient.new_session(system_prompt=…)
+# ---------------------------------------------------------------------------
+
+from kiro.acp_models import PromptMessage  # noqa: E402
+
+
+class _SystemPromptRecordingACP(StubACP):
+    """Stub that records the ``system_prompt`` kwarg passed to new_session."""
+
+    def __init__(self):
+        super().__init__([{"type": "text", "content": "ok"},
+                          {"type": "done", "finish_reason": "stop", "usage": {}}])
+        self.new_session_kwargs: list[dict] = []
+
+    async def new_session(self, capabilities=None, cwd=None, model=None,
+                          mcp_servers=None, **kwargs) -> str:
+        self.new_session_kwargs.append(kwargs)
+        return "stub-session-id"
+
+
+class TestShimServiceSystemPrompt:
+    """Both complete() and stream_tokens() hand the leading system prompt over."""
+
+    _MESSAGES = [
+        PromptMessage(role="system", content="You are Claude."),
+        PromptMessage(role="developer", content="Be brief."),
+        PromptMessage(role="user", content="hi"),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_leading_system_prompt_forwarded(self, stream):
+        acp = _SystemPromptRecordingACP()
+        shim = ShimService(acp)
+
+        if stream:
+            _ = [e async for e in shim.stream_tokens(messages=self._MESSAGES)]
+        else:
+            await shim.complete(messages=self._MESSAGES)
+
+        assert acp.new_session_kwargs == [{"system_prompt": "You are Claude.\n\nBe brief."}]
+        # The full transcript still reaches the prompt; ACPClient strips it.
+        assert acp.last_params.messages == self._MESSAGES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("messages", [
+        [PromptMessage(role="user", content="hi")],
+        [PromptMessage(role="system", content="only a system prompt")],
+    ])
+    async def test_not_forwarded_without_system_or_turn(self, messages):
+        acp = _SystemPromptRecordingACP()
+
+        await ShimService(acp).complete(messages=messages)
+
+        assert acp.new_session_kwargs == [{}]

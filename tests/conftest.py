@@ -21,6 +21,20 @@ from kiro.acp_models import (
 )
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_agents_dir(tmp_path_factory):
+    """Keep ephemeral system-prompt agents out of the real ``~/.kiro/agents``.
+
+    ``ACPClient`` writes them to kiro-cli's global agent directory by default;
+    no test may touch the developer's real kiro-cli configuration.
+    """
+    agents_dir = tmp_path_factory.mktemp("kiro-agents")
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr("kiro.system_prompt_agent.default_agents_dir", lambda: agents_dir)
+        patcher.setattr("kiro.acp_client.default_agents_dir", lambda: agents_dir)
+        yield agents_dir
+
+
 # ---------------------------------------------------------------------------
 # OpenAI fixtures
 # ---------------------------------------------------------------------------

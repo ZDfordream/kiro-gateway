@@ -2346,3 +2346,267 @@ class TestPromptStreamLimiting:
         await feeder
         texts = "".join(e["content"] for e in events if e["type"] == "text")
         assert texts == "one two three four five"
+
+
+# ---------------------------------------------------------------------------
+# Harness system prompt via an ephemeral kiro-cli agent (jwadow/kiro-gateway
+# PR #278 feedback): models disregard a ``System:`` label in the user turn, so
+# new_session installs the prompt as a custom agent's ``prompt`` instead.
+# ---------------------------------------------------------------------------
+
+from kiro.system_prompt_agent import EPHEMERAL_AGENT_PREFIX  # noqa: E402
+
+# Captured at import, before the session-scoped ``test_client`` fixture patches
+# ACPClient.start for the whole session.
+_REAL_START = ACPClient.start
+
+_SYSTEM = "The assistant is Claude, created by Anthropic."
+_SESSION_NEW_RESULT = {
+    "sessionId": "sp-1",
+    "models": {"currentModelId": "claude-opus-5.5", "availableModels": []},
+    "modes": {"currentModeId": "kiro_default", "availableModes": [
+        {"id": "kiro_default", "name": "kiro_default"},
+        {"id": f"{EPHEMERAL_AGENT_PREFIX}other", "name": "in-flight"},
+    ]},
+}
+
+
+def _system_prompt_client(tmp_path, **kwargs):
+    """ACPClient whose _call records methods, params and agent-file presence."""
+    agents_dir = tmp_path / "agents"
+    client = ACPClient(system_prompt_channel=kwargs.pop("channel", "agent"),
+                       agents_dir=agents_dir, **kwargs)
+    calls: list[dict] = []
+    fail = {"method": None}
+
+    async def fake_call(method, params, timeout=120.0):
+        files = sorted(p.name for p in agents_dir.glob("*.json")) if agents_dir.exists() else []
+        calls.append({"method": method, "params": params, "files": files})
+        if method == fail["method"]:
+            raise ACPError(-32603, "Internal error", "Mode not found")
+        if method == "session/new":
+            return dict(_SESSION_NEW_RESULT)
+        return {}
+
+    client._call = fake_call  # type: ignore[assignment]
+    return client, calls, agents_dir, fail
+
+
+async def _prompt_text(client: ACPClient, session_id: str, messages) -> str:
+    """Run the real prompt_stream and return the session/prompt text block."""
+    written: list[str] = []
+
+    async def fake_write_line(line: str) -> None:
+        written.append(line)
+
+    client._write_line = fake_write_line  # type: ignore[assignment]
+    params = PromptParams(session_id=session_id, messages=messages)
+    feeder = asyncio.create_task(_drive_queue(
+        client, session_id, [{"type": "done", "finish_reason": "stop", "usage": {}}]
+    ))
+    _ = [event async for event in _REAL_PROMPT_STREAM(client, params)]
+    await feeder
+    payload = json.loads(next(w for w in written if '"session/prompt"' in w))
+    return payload["params"]["prompt"][0]["text"]
+
+
+_CONVERSATION = [
+    PromptMessage(role="system", content=_SYSTEM),
+    PromptMessage(role="user", content="Who are you?"),
+]
+
+
+class TestSystemPromptAgentSuccess:
+    """The system prompt reaches kiro-cli as an agent prompt, sent once."""
+
+    @pytest.mark.asyncio
+    async def test_agent_written_selected_and_removed(self, tmp_path):
+        client, calls, agents_dir, _ = _system_prompt_client(tmp_path)
+
+        session_id = await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        new, set_mode = calls[0], calls[1]
+        assert new["method"] == "session/new"
+        assert len(new["files"]) == 1  # present when kiro-cli rescans agents
+        agent_name = set_mode["params"]["modeId"]
+        assert set_mode["method"] == "session/set_mode"
+        assert agent_name.startswith(EPHEMERAL_AGENT_PREFIX)
+        assert set_mode["files"] == [f"{agent_name}.json"]
+        assert list(agents_dir.iterdir()) == []  # deleted after selection
+        assert session_id in client._system_prompt_sessions
+
+    @pytest.mark.asyncio
+    async def test_agent_file_carries_the_prompt(self, tmp_path, monkeypatch):
+        client, _, _, _ = _system_prompt_client(tmp_path)
+        seen: dict = {}
+        import kiro.acp_client as acp_module
+        real_write = acp_module.write_agent
+
+        def spy(prompt, agents_dir=None):
+            name, path = real_write(prompt, agents_dir)
+            seen.update(json.loads(path.read_text()))
+            return name, path
+
+        monkeypatch.setattr(acp_module, "write_agent", spy)
+        await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert seen["prompt"] == _SYSTEM
+        assert seen["tools"] == ["*"] and seen["includeMcpJson"] is True
+
+    @pytest.mark.asyncio
+    async def test_model_selected_after_agent(self, tmp_path):
+        client, calls, _, _ = _system_prompt_client(tmp_path)
+
+        await _REAL_NEW_SESSION(client, model="auto", system_prompt=_SYSTEM)
+
+        assert [c["method"] for c in calls] == [
+            "session/new", "session/set_mode", "session/set_model"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_prompt_omits_installed_system_prompt(self, tmp_path):
+        client, _, _, _ = _system_prompt_client(tmp_path)
+        session_id = await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        text = await _prompt_text(client, session_id, _CONVERSATION)
+
+        assert text == "Who are you?"
+        assert session_id not in client._system_prompt_sessions  # one turn only
+
+    @pytest.mark.asyncio
+    async def test_later_system_messages_stay_in_transcript(self, tmp_path):
+        client, _, _, _ = _system_prompt_client(tmp_path)
+        session_id = await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        text = await _prompt_text(client, session_id, [
+            *_CONVERSATION,
+            PromptMessage(role="assistant", content="I'm Claude."),
+            PromptMessage(role="system", content="Reminder: be brief."),
+            PromptMessage(role="user", content="Thanks"),
+        ])
+
+        assert _SYSTEM not in text
+        assert text.startswith("User: Who are you?")
+        assert "System: Reminder: be brief." in text
+
+    @pytest.mark.asyncio
+    async def test_default_mode_and_catalogue_unaffected(self, tmp_path):
+        client, _, _, _ = _system_prompt_client(tmp_path)
+
+        await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert client._current_mode_id == "kiro_default"
+        assert [m["id"] for m in client._available_modes] == ["kiro_default"]
+
+
+class TestSystemPromptAgentFallback:
+    """Any failure keeps the legacy inline label; nothing is left on disk."""
+
+    @pytest.mark.asyncio
+    async def test_set_mode_failure_keeps_prompt_inline(self, tmp_path):
+        client, _, agents_dir, fail = _system_prompt_client(tmp_path)
+        fail["method"] = "session/set_mode"
+
+        session_id = await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert session_id not in client._system_prompt_sessions
+        assert list(agents_dir.iterdir()) == []
+        text = await _prompt_text(client, session_id, _CONVERSATION)
+        assert text == f"System: {_SYSTEM}\n\nUser: Who are you?"
+
+    @pytest.mark.asyncio
+    async def test_session_new_failure_removes_agent_file(self, tmp_path):
+        client, _, agents_dir, fail = _system_prompt_client(tmp_path)
+        fail["method"] = "session/new"
+
+        with pytest.raises(ACPError):
+            await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert list(agents_dir.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_unwritable_agents_dir_keeps_prompt_inline(self, tmp_path):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x")
+        client, calls, _, _ = _system_prompt_client(tmp_path)
+        client._agents_dir = blocker / "agents"
+
+        session_id = await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert [c["method"] for c in calls] == ["session/new"]
+        assert session_id not in client._system_prompt_sessions
+
+
+class TestSystemPromptAgentSkipped:
+    """The agent path is skipped where it would change behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_inline_channel_writes_nothing(self, tmp_path):
+        client, calls, agents_dir, _ = _system_prompt_client(tmp_path, channel="inline")
+
+        session_id = await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert [c["method"] for c in calls] == ["session/new"]
+        assert not agents_dir.exists()
+        assert session_id not in client._system_prompt_sessions
+
+    @pytest.mark.asyncio
+    async def test_configured_mode_keeps_its_persona(self, tmp_path):
+        client, calls, agents_dir, _ = _system_prompt_client(tmp_path, mode="code")
+
+        await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert [(c["method"], c["params"].get("modeId")) for c in calls] == [
+            ("session/new", None), ("session/set_mode", "code")
+        ]
+        assert not agents_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_configured_spawn_agent_keeps_its_persona(self, tmp_path):
+        client, calls, _, _ = _system_prompt_client(tmp_path, agent="code")
+
+        await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
+
+        assert [c["method"] for c in calls] == ["session/new"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prompt", [None, "", "   "])
+    async def test_no_system_prompt_adds_no_round_trip(self, tmp_path, prompt):
+        client, calls, agents_dir, _ = _system_prompt_client(tmp_path)
+
+        await _REAL_NEW_SESSION(client, system_prompt=prompt)
+
+        assert [c["method"] for c in calls] == ["session/new"]
+        assert not agents_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_unmarked_session_keeps_label(self, tmp_path):
+        client, _, _, _ = _system_prompt_client(tmp_path)
+
+        text = await _prompt_text(client, "never-installed", _CONVERSATION)
+
+        assert text == f"System: {_SYSTEM}\n\nUser: Who are you?"
+
+
+class TestStaleAgentCleanupOnStart:
+    """start() clears crash leftovers only when the agent channel is active."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel, expected_calls", [("agent", 1), ("inline", 0)])
+    async def test_start_cleans_stale_agents(self, tmp_path, monkeypatch, channel,
+                                             expected_calls):
+        import kiro.acp_client as acp_module
+        seen: list = []
+        monkeypatch.setattr(acp_module, "cleanup_stale_agents",
+                            lambda directory: seen.append(directory) or 0)
+
+        async def fake_exec(*args, **kwargs):
+            raise RuntimeError("spawn stopped by test")
+
+        monkeypatch.setattr(acp_module.asyncio, "create_subprocess_exec", fake_exec)
+        client = ACPClient(system_prompt_channel=channel, agents_dir=tmp_path)
+
+        with pytest.raises(RuntimeError):
+            await _REAL_START(client)
+
+        assert len(seen) == expected_calls

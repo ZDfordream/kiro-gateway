@@ -26,6 +26,7 @@ from loguru import logger
 
 from kiro.acp_client import ACPClient, render_tool_activity, render_tool_call_summary
 from kiro.config import settings
+from kiro.system_prompt_agent import split_leading_system
 from kiro.acp_models import (
     PromptParams, PromptMessage,
     ToolResult,
@@ -282,7 +283,9 @@ class ShimService:
             {"content": str, "reasoning": str, "tool_calls": list[dict],
              "finish_reason": str, "usage": dict}
         """
-        session_id = await self._new_session(filesystem_roots, terminal, model, mcp_servers)
+        session_id = await self._new_session(
+            filesystem_roots, terminal, model, mcp_servers, messages
+        )
         params = PromptParams(
             session_id=session_id,
             messages=messages,
@@ -367,7 +370,9 @@ class ShimService:
             surface_thinking: Whether kiro-cli's reasoning channel (thinking +
                 folded tool activity) is surfaced.
         """
-        session_id = await self._new_session(filesystem_roots, terminal, model, mcp_servers)
+        session_id = await self._new_session(
+            filesystem_roots, terminal, model, mcp_servers, messages
+        )
         declared_tools = normalize_tool_definitions(tools)
         params = PromptParams(
             session_id=session_id,
@@ -448,12 +453,23 @@ class ShimService:
         terminal: Optional[TerminalCapability] = None,
         model: Optional[str] = None,
         mcp_servers: Optional[list[dict]] = None,
+        messages: list[PromptMessage] | None = None,
     ) -> str:
         caps = GatewayCapabilities(
             filesystem=fs_roots or self._default_fs_roots or [],
             terminal=terminal or self._default_terminal,
         )
-        return await self._acp.new_session(caps, model=model, mcp_servers=mcp_servers)
+        extra: dict[str, Any] = {}
+        system_prompt, rest = split_leading_system(messages or [])
+        if system_prompt and rest:
+            # Lets ACPClient install it as the session's agent prompt instead
+            # of a ``System:`` label (kiro.system_prompt_agent). Only passed when
+            # present, and only when a turn remains to send, so ACP clients
+            # without the parameter keep working.
+            extra["system_prompt"] = system_prompt
+        return await self._acp.new_session(
+            caps, model=model, mcp_servers=mcp_servers, **extra
+        )
 
     def available_models(self) -> list[dict]:
         """Return the live model catalogue discovered from kiro-cli sessions.

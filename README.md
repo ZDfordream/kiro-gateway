@@ -505,25 +505,54 @@ on a non-streaming completion or as a streaming error event.
 ## System & developer roles
 
 Instruction provenance is preserved rather than flattened into anonymous user
-text. ACP has no dedicated system channel, so a fresh-session prompt is
-serialised into a single text block — but each message keeps its role label
-(`System:` / `Developer:` / `User:` / `Assistant:`) and its order, and multiple
-system messages are kept distinct rather than merged.
+text.
+
+**The leading system prompt goes into kiro-cli's own system prompt.** ACP has
+no system role, so by default the gateway delivers the system/developer
+messages that open a conversation through kiro-cli's documented system-prompt
+channel. It writes an ephemeral custom agent whose `prompt` is the harness
+system prompt, selects it for the request's session with `session/set_mode`,
+and deletes the file at once. The agent mirrors kiro-cli's default agent
+(`tools: ["*"]`, `includeMcpJson: true`), so tools, MCP servers and workspace
+`AGENTS.md` behave as before. The prompt is sent once, not repeated in the
+turn.
+
+Why: a `System:` label inside the user turn reads as user-supplied text, so
+models favour kiro-cli's own system prompt over it. In a live probe (kiro-cli
+2.28.0, claude-opus-5.5, Claude-Desktop-style system prompt, "who are you?"),
+the model answered as Claude in 12 of 12 turns with the agent channel and in
+4 of 12 with the label. Context size and credits were the same either way.
+kiro-cli's built-in system prompt is always kept, so this changes where the
+harness prompt lands, not how many tokens it costs.
+
+- Set `KIRO_SYSTEM_PROMPT=inline` to restore the label.
+- The label is also used when `KIRO_ACP_MODE` or `KIRO_ACP_AGENT` selects a
+  persona (its agent config is kept) and as an automatic fallback if the agent
+  cannot be written or selected.
+- Agents live in `~/.kiro/agents` as `kiro-gateway-sys-*.json` for the moment
+  between `session/new` and `session/set_mode`. Files left by a crash are
+  removed at startup.
+- Cost: selecting an agent re-initialises kiro-cli's global MCP servers, which
+  added about 1.6s per request with 10 servers configured (about 0.1s with
+  none).
+
+Everything else is serialised into a single text block, where each message
+keeps its role label (`System:` / `Developer:` / `User:` / `Assistant:`) and
+its order, and multiple system messages are kept distinct rather than merged.
 
 | Client input | Carried as | Rendered prompt label |
 |---|---|---|
-| OpenAI `system` message | `system` role | `System:` |
-| OpenAI `developer` message | `developer` role | `Developer:` |
+| OpenAI `system` message | `system` role | agent prompt when leading, else `System:` |
+| OpenAI `developer` message | `developer` role | agent prompt when leading, else `Developer:` |
 | OpenAI `assistant` `tool_calls` | `assistant` role (with `[tool_use id=… name=…]` markers) | `Assistant:` |
 | OpenAI `tool` message | `user` role (with `[tool_result id=…]` marker) | `User:` |
-| OpenAI Responses `instructions` | `system` role | `System:` |
-| Anthropic `system` field (string or block list) | `system` role | `System:` |
+| OpenAI Responses `instructions` | `system` role | agent prompt |
+| Anthropic `system` field (string or block list) | `system` role | agent prompt |
 | Anthropic `tool_use` block | `assistant` role (with `[tool_use id=… name=…]` marker) | `Assistant:` |
 | Anthropic `tool_result` block | `user` role (with `[tool_result id=…]` marker) | `User:` |
 
-> kiro-cli treats the whole serialised prompt as one turn; these labels make
-> the system/developer instructions legible to the agent without inventing a
-> system channel the protocol does not expose.
+> kiro-cli treats the serialised prompt as one turn; the labels make later
+> system/developer instructions legible to the agent.
 
 ### Multi-turn & tool history fidelity
 

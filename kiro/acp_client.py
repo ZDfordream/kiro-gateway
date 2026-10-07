@@ -51,6 +51,7 @@ import os
 import re as _re
 import uuid
 from asyncio import Queue
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from loguru import logger
@@ -63,6 +64,14 @@ from kiro.acp_models import (
 )
 from kiro.config import ACP_STDIO_MAX_BYTES, settings
 from kiro.output_limits import StreamLimiter
+from kiro.system_prompt_agent import (
+    cleanup_stale_agents,
+    default_agents_dir,
+    is_ephemeral_agent,
+    remove_agent,
+    split_leading_system,
+    write_agent,
+)
 from kiro.tool_permissions import (
     DECISION_ALLOW,
     DECISION_DENY,
@@ -411,9 +420,22 @@ class ACPClient:
         tool_audit_max_tools: Optional[int] = None,
         tool_audit_max_bytes: Optional[int] = None,
         tool_audit_max_updates: Optional[int] = None,
+        system_prompt_channel: str | None = None,
+        agents_dir: Path | None = None,
     ):
         self._command = command
         self._trust_tools = trust_tools
+        # Where a harness system prompt goes (see kiro.system_prompt_agent):
+        # "agent" installs it as an ephemeral custom agent's prompt, "inline"
+        # keeps the legacy ``System:`` label in the user turn.
+        self._system_prompt_channel = (
+            settings.SYSTEM_PROMPT_CHANNEL
+            if system_prompt_channel is None else system_prompt_channel
+        )
+        self._agents_dir = agents_dir or default_agents_dir()
+        # Sessions whose leading system prompt was installed as an agent
+        # prompt; their prompt_stream turn omits it from the transcript.
+        self._system_prompt_sessions: set[str] = set()
         # Declarative allow/deny rules consulted on every
         # session/request_permission (issue #31 comment). ``None`` or an empty
         # policy means only ``trust_tools`` applies, so behaviour is unchanged
@@ -557,6 +579,11 @@ class ACPClient:
     async def start(self) -> None:
         """Spawn ``kiro-cli acp`` and begin reading its stdio."""
         argv = self._build_argv()
+        if self._system_prompt_channel == "agent":
+            try:
+                cleanup_stale_agents(self._agents_dir)
+            except OSError as exc:
+                logger.warning(f"Stale ephemeral agent cleanup failed: {exc}")
         logger.info(f"Spawning ACP subprocess: {' '.join(argv)}")
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -643,6 +670,7 @@ class ACPClient:
         model: Optional[str] = None,
         mode: Optional[str] = None,
         mcp_servers: Optional[list[dict]] = None,
+        system_prompt: str | None = None,
     ) -> str:
         """
         Create a fresh ACP session and return its id.
@@ -667,12 +695,134 @@ class ACPClient:
                 regardless of config (used by the warm-up session so a
                 misconfigured/unreachable server cannot block startup). kiro-cli
                 executes these tools itself (``mcpCapabilities.http``).
+            system_prompt: Optional harness system prompt. With the ``agent``
+                channel (default) and no configured mode/agent persona, it is
+                installed as the prompt of an ephemeral kiro-cli agent selected
+                for this session (see :mod:`kiro.system_prompt_agent`), and the
+                session's turn then omits it from the transcript. If that cannot
+                be done, the session is created normally and the prompt stays
+                in the transcript as a ``System:`` label.
 
         Returns:
             The agent-assigned ``sessionId``.
         """
         workdir = cwd or self._derive_cwd(capabilities)
         servers = self._mcp_servers if mcp_servers is None else mcp_servers
+        desired_mode = mode or self._mode
+
+        agent_name: str | None = None
+        agent_file: Path | None = None
+        if self._wants_system_prompt_agent(system_prompt, desired_mode):
+            try:
+                # Written before session/new: kiro-cli discovers agents when the
+                # session is created.
+                agent_name, agent_file = write_agent(
+                    str(system_prompt), self._agents_dir
+                )
+            except OSError as exc:
+                logger.warning(
+                    f"Could not write ephemeral system-prompt agent in "
+                    f"{self._agents_dir}: {exc}; sending the system prompt inline"
+                )
+        installed = False
+        try:
+            result = await self._open_session(workdir, servers)
+            session_id = str(result["sessionId"])
+            self._session_id = session_id
+            self._capture_available_models(result)
+            self._capture_available_modes(result)
+            logger.debug(f"ACP session created: {session_id} (cwd={workdir})")
+            if agent_name:
+                installed = await self._install_system_prompt_agent(
+                    session_id, agent_name
+                )
+        finally:
+            if agent_file is not None:
+                # The session keeps the prompt once the mode is selected, so the
+                # file is never needed past this point (live probe).
+                remove_agent(agent_file)
+        if installed:
+            self._system_prompt_sessions.add(session_id)
+        elif desired_mode and desired_mode != self._current_mode_id:
+            # Select the mode ("agent") only when one is requested (per call or
+            # via the configured default) and it differs from the session's
+            # current mode, so the common default-mode path adds no round-trip.
+            await self.set_mode(session_id, desired_mode)
+        # The model is selected after the agent, so switching agents cannot
+        # reset it. Only issued when the requested model differs from the
+        # session's current default, avoiding a redundant RTT.
+        if model and model != self._current_model_id:
+            await self.set_model(session_id, model)
+        return session_id
+
+    def _wants_system_prompt_agent(
+        self, system_prompt: str | None, desired_mode: str | None
+    ) -> bool:
+        """Decide whether a system prompt should go through an ephemeral agent.
+
+        Args:
+            system_prompt: The harness system prompt (may be empty).
+            desired_mode: The per-call or configured mode (``KIRO_ACP_MODE``).
+
+        Returns:
+            ``True`` only with the ``agent`` channel, a non-empty prompt, and no
+            configured persona (``KIRO_ACP_MODE`` / ``KIRO_ACP_AGENT``). A
+            persona keeps its own agent config, so the prompt stays inline.
+        """
+        if not system_prompt or not system_prompt.strip():
+            return False
+        if self._system_prompt_channel != "agent":
+            return False
+        if desired_mode or self._agent:
+            logger.debug(
+                "Agent persona configured; sending the system prompt inline"
+            )
+            return False
+        return True
+
+    async def _install_system_prompt_agent(
+        self, session_id: str, agent_name: str
+    ) -> bool:
+        """Select the ephemeral system-prompt agent for a session.
+
+        Unlike :meth:`set_mode`, this reports failure (kiro-cli answers an
+        unknown mode with ``Mode '<id>' not found``) so the caller can keep the
+        prompt inline, and it leaves ``_current_mode_id`` alone: the agent is
+        per-session and must not change the default for later sessions.
+
+        Args:
+            session_id: The new session.
+            agent_name: The mode id written by :func:`write_agent`.
+
+        Returns:
+            ``True`` when kiro-cli accepted the mode.
+        """
+        try:
+            await self._call(
+                "session/set_mode", {"sessionId": session_id, "modeId": agent_name}
+            )
+        except ACPError as exc:
+            logger.warning(
+                f"Could not select the system-prompt agent for session "
+                f"{session_id}: {exc}; sending the system prompt inline"
+            )
+            return False
+        logger.debug(f"ACP session {session_id} uses system-prompt agent {agent_name}")
+        return True
+
+    async def _open_session(self, workdir: str, servers: list[dict]) -> dict:
+        """Issue ``session/new`` with the bounded MCP timeout and fallback.
+
+        Args:
+            workdir: Absolute session working directory.
+            servers: MCP servers to register.
+
+        Returns:
+            The ``session/new`` result (guaranteed to carry ``sessionId``).
+
+        Raises:
+            ACPError: If kiro-cli fails or returns no ``sessionId``.
+        """
         params = {"cwd": workdir, "mcpServers": servers}
         if servers:
             logger.info(
@@ -711,23 +861,7 @@ class ACPClient:
             result = await self._call("session/new", params)
         if not isinstance(result, dict) or "sessionId" not in result:
             raise ACPError(-32603, f"session/new returned no sessionId: {result!r}")
-        session_id = str(result["sessionId"])
-        self._session_id = session_id
-        self._capture_available_models(result)
-        self._capture_available_modes(result)
-        logger.debug(f"ACP session created: {session_id} (cwd={workdir})")
-        # Only issue the extra session/set_model round-trip when the requested
-        # model differs from the session's current default. This avoids a
-        # redundant RTT on every request for agents that use the default model.
-        if model and model != self._current_model_id:
-            await self.set_model(session_id, model)
-        # Likewise select the mode ("agent") only when one is requested (per
-        # call or via the configured default) and it differs from the session's
-        # current mode, so the common default-mode path adds no round-trip.
-        desired_mode = mode or self._mode
-        if desired_mode and desired_mode != self._current_mode_id:
-            await self.set_mode(session_id, desired_mode)
-        return session_id
+        return result
 
     def _capture_available_models(self, session_result: dict) -> None:
         """
@@ -831,7 +965,9 @@ class ACPClient:
             if not isinstance(entry, dict):
                 continue
             mode_id = entry.get("id")
-            if not mode_id:
+            if not mode_id or is_ephemeral_agent(mode_id):
+                # Another in-flight request's system-prompt agent: per-session,
+                # never part of the advertised catalogue.
                 continue
             normalised.append({
                 "id": str(mode_id),
@@ -845,11 +981,11 @@ class ACPClient:
         """
         Select the mode ("agent") for a session via ``session/set_mode``.
 
-        Mirrors :meth:`set_model`: kiro-cli accepts the request silently and
-        does not validate the id (an unknown mode leaves the session on its
-        default), so failures are logged and swallowed — a mode-selection
-        problem never breaks the completion itself. Verified against a live
-        kiro-cli 2.12.0 probe: ``{"sessionId", "modeId"}`` → ``{}``.
+        Mirrors :meth:`set_model`: failures are logged and swallowed so a
+        mode-selection problem never breaks the completion itself (the session
+        keeps its default mode). Verified against a live kiro-cli 2.12.0 probe:
+        ``{"sessionId", "modeId"}`` → ``{}``; kiro-cli 2.28.0 answers an unknown
+        mode with an ``Internal error`` / ``Mode '<id>' not found`` error.
 
         Args:
             session_id: The ACP session to configure.
@@ -977,7 +1113,13 @@ class ACPClient:
             raise ACPError(-32602, "prompt_stream requires a session_id")
 
         self._tool_audit.begin(session_id)
-        prompt_blocks = self._build_prompt_blocks(params.messages)
+        messages = params.messages
+        if session_id in self._system_prompt_sessions:
+            # The leading system prompt is already the session's agent prompt;
+            # repeating it as a ``System:`` label would send it twice.
+            self._system_prompt_sessions.discard(session_id)
+            _, messages = split_leading_system(messages)
+        prompt_blocks = self._build_prompt_blocks(messages)
         queue: Queue = Queue()
         self._event_queues[session_id] = queue
 

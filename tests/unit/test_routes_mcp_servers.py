@@ -59,7 +59,8 @@ def captured_mcp(monkeypatch, tmp_path):
         pass
 
     async def _capture_new_session(self, capabilities=None, cwd=None, model=None,
-                                   mode=None, mcp_servers=None) -> str:
+                                   mode=None, mcp_servers=None,
+                                   system_prompt=None) -> str:
         captured["calls"].append(mcp_servers)
         return "test-session-id"
 

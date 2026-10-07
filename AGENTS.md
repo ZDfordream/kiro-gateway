@@ -107,6 +107,7 @@ kiro-gateway/
 │   ├── routes_anthropic_shim.py# /v1/messages, /v1/models
 │   ├── routes_acp.py           # /acp/chat, /acp/chat/stream
 │   ├── harness_mcp.py          # Discover the harness's own MCP servers (issue #75)
+│   ├── system_prompt_agent.py  # Leading system prompt → ephemeral kiro-cli agent prompt
 │   ├── config.py               # Env-driven settings (settings object + module constants)
 │   ├── compliance.py           # Single-account enforcement at startup
 │   └── capability_executor.py  # Stub capability dispatch (retained; not in the live path)
@@ -433,8 +434,68 @@ provenance is preserved instead of being flattened to anonymous user text:
   `[system]` user prefix).
 - `ACPClient._build_prompt_blocks` renders each message with a `System:` /
   `Developer:` / `User:` / `Assistant:` label, preserving order and keeping
-  multiple system messages distinct. ACP exposes no system channel, so this
-  labelled single-block serialisation is the faithful representation.
+  multiple system messages distinct.
+
+### Leading system prompt → ephemeral agent (`kiro/system_prompt_agent.py`)
+
+ACP has no system role, so a `System:` label lands **inside the user turn**,
+and models treat it as user-supplied text and favour kiro-cli's own system
+prompt. This was reported on jwadow/kiro-gateway#278 for Claude Desktop.
+Verified against a live kiro-cli 2.28.0 probe (claude-opus-5.5) with a
+Claude-Desktop-style system prompt and the question "who are you": the model
+answered as Claude in **4/12** turns with the label and **12/12** with the
+agent channel (raw ACP and end-to-end `/v1/messages`, stream + non-stream).
+
+kiro-cli's documented system-prompt channel is a custom agent's `prompt`. The
+flow (`ACPClient.new_session(system_prompt=…)`):
+
+1. `ShimService._new_session` passes `split_leading_system(messages)`: the
+   contiguous leading `system`/`developer` string messages, but only when a
+   turn remains after them.
+2. `write_agent` atomically writes `~/.kiro/agents/kiro-gateway-sys-<hex>.json`
+   (`tools: ["*"]`, `includeMcpJson: true`, `prompt`) **before** `session/new`.
+3. `session/set_mode` selects it (`_install_system_prompt_agent`, which, unlike
+   `set_mode`, reports failure and leaves `_current_mode_id` alone). The file is
+   deleted in a `finally` right after.
+4. `prompt_stream` drops the leading system run for that session (once), so the
+   prompt is not sent twice.
+
+Live-probed facts this relies on:
+
+- kiro-cli rescans `~/.kiro/agents` on every `session/new`.
+- The file can be deleted right after `set_mode` and the session keeps the
+  prompt.
+- Concurrent sessions with different agents stay isolated.
+- An unknown mode returns an error (`Mode '<id>' not found`), so a failure can
+  be detected and the gateway falls back to the label.
+- The mirror agent matches `kiro_default`: same context %, workspace
+  `AGENTS.md` still loaded, `session/new` `mcpServers` still honoured.
+
+Workspace-local agents are discovered from kiro-cli's **process** cwd, which is
+why the files go to the global dir instead.
+
+Rules:
+
+- `KIRO_SYSTEM_PROMPT=inline` restores the label.
+- A configured persona (`KIRO_ACP_MODE` / `KIRO_ACP_AGENT`) keeps its own
+  agent config, so the label is used.
+- Any write or `set_mode` failure falls back to the label without failing the
+  turn.
+- Ephemeral ids are filtered from `_available_modes`.
+- `start()` removes stale files older than 10 minutes. That threshold is safe
+  for another gateway instance sharing the dir.
+- The model is now selected **after** the mode/agent, so an agent switch
+  cannot reset it.
+
+Cost: `set_mode` re-initialises kiro-cli's global MCP servers, which took
+~1.6s with 10 servers and ~0.1s with none. Tokens are unchanged: kiro-cli's
+built-in prompt is always kept, and its tool/MCP schemas (not the prompt) are
+most of the context.
+
+Tests: `tests/unit/test_system_prompt_agent.py`, `TestSystemPromptAgent*` in
+`test_acp_client.py`, and `TestShimServiceSystemPrompt`. The autouse
+`_isolated_agents_dir` conftest fixture keeps every test out of the real
+`~/.kiro/agents`. Keep it in place when touching this code.
 
 ### Multi-turn & tool history (issue #43)
 
@@ -674,7 +735,8 @@ take precedence over `.env`).
 | `MCP_INIT_TIMEOUT` | `30` | Seconds cap for `session/new` **when MCP servers are registered**, so a malformed/unreachable server fails fast (timeout → `504`) instead of stalling every request for `ACP_TIMEOUT`. Sessions without MCP servers use `ACP_TIMEOUT`. |
 | `MCP_DISCOVERY` | `all` | Scope for discovering the **harness's own** MCP servers (`kiro.harness_mcp`) and forwarding them on `session/new` — on by default, no config needed. `all` = user + workspace configs; `user` = user-level only (hardening for untrusted repos); `off` = disable. Not in `.env.example` by design. |
 | `ACP_WORKSPACE_DIR` | process cwd | **Fallback** session `cwd`. The cwd is resolved per request (`X-Kiro-Workspace` header → `filesystem_roots` → the prompt `<env>` `Working directory:` line, parsed by `kiro.workspace`) so kiro-cli anchors in the harness's directory by default; this is used only when none is present. cwd is an anchor, not a jail (verified live) — tools still reach absolute paths elsewhere. |
-| `KIRO_ACP_MODE` | `` (kiro-cli default) | Agent persona selected per session via `session/set_mode` (`kiro_default`, `code`, `kiro_planner`, `kiro_guide`). Unknown value accepted silently (keeps default). Distinct from `KIRO_ACP_MODEL`. |
+| `KIRO_ACP_MODE` | `` (kiro-cli default) | Agent persona selected per session via `session/set_mode` (`kiro_default`, `code`, `kiro_planner`, `kiro_guide`). Unknown value accepted silently (keeps default). Distinct from `KIRO_ACP_MODEL`. When set, the harness system prompt stays an inline `System:` label. |
+| `KIRO_SYSTEM_PROMPT` | `agent` | Where the leading harness system prompt goes. `agent` = an ephemeral kiro-cli custom agent's `prompt` (real system prompt; see "Leading system prompt → ephemeral agent"); `inline` (also `label`/`off`/`false`) = the legacy `System:` label in the user turn. |
 | `KIRO_ACP_ENGINE` | `v2` | `--agent-engine` (`v1`/`v2`/`v3`), pinned explicitly so a future default-engine flip can't change behaviour. `v3` needs host-mediated auth the gateway lacks (issue #52) — generation fails; keep `v2`. Invalid value falls back to `v2`. |
 | `KIRO_ACP_AGENT` | `` (none) | `--agent`: (custom) agent config for the first session (spawn flag). |
 | `KIRO_ACP_MODEL` | `` (none) | `--model`: initial session model at spawn. Distinct from `KIRO_ACP_MODE`; a per-request model still overrides it. |

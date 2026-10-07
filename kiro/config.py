@@ -461,6 +461,34 @@ ACP_WORKSPACE_DIR: str = os.environ.get("ACP_WORKSPACE_DIR", os.getcwd())
 # mis-set value never fails the turn.
 ACP_MODE: str = os.environ.get("KIRO_ACP_MODE", "").strip()
 
+
+def _parse_system_prompt_channel(raw: str) -> str:
+    """Normalise ``KIRO_SYSTEM_PROMPT`` to ``"agent"`` or ``"inline"``.
+
+    Args:
+        raw: The raw environment value.
+
+    Returns:
+        ``"inline"`` for ``inline``/``label``/``off``/``false``/``0``/``no``,
+        otherwise ``"agent"`` (the default, including unset/unrecognised).
+    """
+    value = (raw or "").strip().lower()
+    if value in ("inline", "label", "off", "false", "0", "no"):
+        return "inline"
+    return "agent"
+
+
+# Where a harness system prompt reaches kiro-cli's model. ACP has no system
+# channel, so historically it was serialised into the user turn as a
+# ``System:`` label — which models reliably treat as user-supplied text and
+# override with kiro-cli's own system prompt. ``agent`` (default) installs it
+# as the ``prompt`` of an ephemeral kiro-cli custom agent selected for the
+# session via session/set_mode, i.e. kiro-cli's documented system-prompt
+# channel (see kiro.system_prompt_agent). ``inline`` restores the label.
+SYSTEM_PROMPT_CHANNEL: str = _parse_system_prompt_channel(
+    os.environ.get("KIRO_SYSTEM_PROMPT", "")
+)
+
 # ---------------------------------------------------------------------------
 # ACP subprocess spawn arguments (issue #53)
 #
@@ -559,6 +587,7 @@ class _Settings:
     MCP_DISCOVERY: str = field(default_factory=lambda: MCP_DISCOVERY)
     ACP_WORKSPACE_DIR: str = field(default_factory=lambda: ACP_WORKSPACE_DIR)
     ACP_MODE: str = field(default_factory=lambda: ACP_MODE)
+    SYSTEM_PROMPT_CHANNEL: str = field(default_factory=lambda: SYSTEM_PROMPT_CHANNEL)
     ACP_AGENT: str = field(default_factory=lambda: ACP_AGENT)
     ACP_MODEL: str = field(default_factory=lambda: ACP_MODEL)
     ACP_EFFORT: str = field(default_factory=lambda: ACP_EFFORT)
