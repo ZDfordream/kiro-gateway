@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 import pytest
 import pytest_asyncio
 
-from kiro.acp_client import ACPClient, ACPError
+# Patch acp_client's own settings reference: another test reloads kiro.config,
+# so kiro.config.settings is not the object the module reads.
+from kiro.acp_client import ACPClient, ACPError, settings as _acp_settings
 from kiro.acp_models import PromptMessage, PromptParams, ACPToolDefinition
 
 # Capture the genuine new_session implementation at import time. The
@@ -2450,7 +2452,11 @@ class TestSystemPromptAgentSuccess:
         monkeypatch.setattr(acp_module, "write_agent", spy)
         await _REAL_NEW_SESSION(client, system_prompt=_SYSTEM)
 
-        assert seen["prompt"] == _SYSTEM
+        # The harness prompt is kept verbatim and the identity guard is
+        # appended (see kiro.system_prompt_agent.IDENTITY_GUARD).
+        from kiro.system_prompt_agent import IDENTITY_GUARD
+
+        assert seen["prompt"] == f"{_SYSTEM}\n\n{IDENTITY_GUARD}"
         assert seen["tools"] == ["*"] and seen["includeMcpJson"] is True
 
     @pytest.mark.asyncio
@@ -2610,3 +2616,125 @@ class TestStaleAgentCleanupOnStart:
             await _REAL_START(client)
 
         assert len(seen) == expected_calls
+
+
+# ---------------------------------------------------------------------------
+# Output identity scrubbing (kiro.identity_scrub)
+#
+# Model replies name the runtime ("kiro-cli", "Kiro Gateway") unless the
+# gateway rewrites them. A brand token can straddle two deltas, so the scrub
+# runs incrementally and flushes its held tail before a terminal event.
+# ---------------------------------------------------------------------------
+
+class TestOutputIdentityScrub:
+    """Streamed and aggregated text never names the runtime."""
+
+    @staticmethod
+    async def _drive_until_queue(client, session_id, events):
+        for _ in range(1000):
+            queue = client._event_queues.get(session_id)
+            if queue is not None:
+                for event in events:
+                    queue.put_nowait(event)
+                return
+            await asyncio.sleep(0)
+        raise AssertionError(f"queue for {session_id} never appeared")
+
+    @staticmethod
+    def _params(session_id: str) -> PromptParams:
+        return PromptParams(
+            session_id=session_id,
+            messages=[PromptMessage(role="user", content="hi")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_brand_token_split_across_chunks_is_not_leaked(self, monkeypatch):
+        monkeypatch.setattr(_acp_settings, "SCRUB_RUNTIME_IDENTITY", True)
+        client = ACPClient()
+        gen = _REAL_PROMPT_STREAM(client, self._params("s-scrub-1"))
+
+        feeder = asyncio.create_task(self._drive_until_queue(client, "s-scrub-1", [
+            {"type": "text", "content": "runs in ki"},
+            {"type": "text", "content": "ro-cli, fine"},
+            {"type": "done", "finish_reason": "stop", "usage": {}},
+        ]))
+        got = [e async for e in gen]
+        await feeder
+
+        text = "".join(e.get("content", "") for e in got if e.get("type") == "text")
+        assert "kiro" not in text.lower()
+        assert "the tool" in text
+
+    @pytest.mark.asyncio
+    async def test_held_tail_is_flushed_before_done(self, monkeypatch):
+        monkeypatch.setattr(_acp_settings, "SCRUB_RUNTIME_IDENTITY", True)
+        client = ACPClient()
+        gen = _REAL_PROMPT_STREAM(client, self._params("s-scrub-2"))
+
+        feeder = asyncio.create_task(self._drive_until_queue(client, "s-scrub-2", [
+            {"type": "text", "content": "ends with ki"},
+            {"type": "done", "finish_reason": "stop", "usage": {}},
+        ]))
+        got = [e async for e in gen]
+        await feeder
+
+        text = "".join(e.get("content", "") for e in got if e.get("type") == "text")
+        assert text.endswith("ki")
+
+    @pytest.mark.asyncio
+    async def test_scrub_can_be_disabled(self, monkeypatch):
+        monkeypatch.setattr(_acp_settings, "SCRUB_RUNTIME_IDENTITY", False)
+        client = ACPClient()
+        gen = _REAL_PROMPT_STREAM(client, self._params("s-scrub-3"))
+
+        feeder = asyncio.create_task(self._drive_until_queue(client, "s-scrub-3", [
+            {"type": "text", "content": "runs in kiro-cli"},
+            {"type": "done", "finish_reason": "stop", "usage": {}},
+        ]))
+        got = [e async for e in gen]
+        await feeder
+
+        text = "".join(e.get("content", "") for e in got if e.get("type") == "text")
+        assert text == "runs in kiro-cli"
+
+    @pytest.mark.asyncio
+    async def test_thinking_text_is_scrubbed_too(self, monkeypatch):
+        monkeypatch.setattr(_acp_settings, "SCRUB_RUNTIME_IDENTITY", True)
+        client = ACPClient()
+        gen = _REAL_PROMPT_STREAM(client, self._params("s-scrub-4"))
+
+        feeder = asyncio.create_task(self._drive_until_queue(client, "s-scrub-4", [
+            {"type": "thinking", "content": "the kiro-cli tool will run"},
+            {"type": "done", "finish_reason": "stop", "usage": {}},
+        ]))
+        got = [e async for e in gen]
+        await feeder
+
+        text = "".join(e.get("content", "") for e in got if e.get("type") == "thinking")
+        assert "kiro" not in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_result_is_scrubbed(self, monkeypatch):
+        monkeypatch.setattr(_acp_settings, "SCRUB_RUNTIME_IDENTITY", True)
+        client = ACPClient()
+
+        # Stub the subprocess write so session/prompt does not block on I/O.
+        async def fake_write_line(line: str) -> None:
+            return None
+
+        client._write_line = fake_write_line  # type: ignore[assignment]
+        params = self._params("s-scrub-5")
+
+        # prompt() consumes self.prompt_stream, which the session-scoped
+        # test_client fixture has replaced with a stand-in. Restore the real
+        # generator for this test or no event queue is ever registered.
+        with patch("kiro.acp_client.ACPClient.prompt_stream", _REAL_PROMPT_STREAM):
+            run = asyncio.create_task(_REAL_PROMPT(client, params))
+            await self._drive_until_queue(client, "s-scrub-5", [
+                {"type": "text", "content": "backed by kiro-gateway"},
+                {"type": "done", "finish_reason": "stop", "usage": {}},
+            ])
+            result = await run
+
+        assert "kiro" not in result["content"].lower()
+        assert "the tool" in result["content"]

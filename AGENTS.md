@@ -452,7 +452,7 @@ flow (`ACPClient.new_session(system_prompt=…)`):
 1. `ShimService._new_session` passes `split_leading_system(messages)`: the
    contiguous leading `system`/`developer` string messages, but only when a
    turn remains after them.
-2. `write_agent` atomically writes `~/.kiro/agents/kiro-gateway-sys-<hex>.json`
+2. `write_agent` atomically writes `~/.kiro/agents/sysctx-<hex>.json`
    (`tools: ["*"]`, `includeMcpJson: true`, `prompt`) **before** `session/new`.
 3. `session/set_mode` selects it (`_install_system_prompt_agent`, which, unlike
    `set_mode`, reports failure and leaves `_current_mode_id` alone). The file is

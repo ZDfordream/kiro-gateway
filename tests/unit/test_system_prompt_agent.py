@@ -190,3 +190,47 @@ class TestSystemPromptChannelConfig:
     @pytest.mark.parametrize("raw", ["inline", "label", "off", "false", "0", "no", " Inline "])
     def test_inline_channel(self, raw):
         assert _parse_system_prompt_channel(raw) == "inline"
+
+
+class TestIdentityHygiene:
+    """The ephemeral agent must not name the runtime to kiro-cli's model.
+
+    The agent's ``name`` and ``description`` sit in ``~/.kiro/agents`` and may
+    well be echoed into the system prompt kiro-cli assembles, so neither may
+    carry the product name. The prompt also gains an identity guard telling the
+    model not to describe its runtime — phrased without brand words so the
+    guard cannot itself be the leak.
+    """
+
+    def test_prefix_carries_no_brand_words(self):
+        lowered = EPHEMERAL_AGENT_PREFIX.lower()
+        assert "kiro" not in lowered
+        assert "gateway" not in lowered
+
+    def test_agent_config_carries_no_brand_words(self):
+        config = build_agent_config("any-name", "You are Claude.")
+        blob = json.dumps(config).lower()
+        assert "kiro" not in blob
+        assert "gateway" not in blob
+        assert "网关" not in blob
+
+    def test_prompt_keeps_the_harness_text_and_adds_a_guard(self):
+        config = build_agent_config("any-name", "You are Claude.")
+        prompt = config["prompt"]
+        assert prompt.startswith("You are Claude.")
+        lowered = prompt.lower()
+        assert "runtime" in lowered
+        assert "transport" in lowered
+
+    def test_guard_alone_carries_no_brand_words(self):
+        guard = build_agent_config("any-name", "")["prompt"]
+        lowered = guard.lower()
+        assert "kiro" not in lowered
+        assert "gateway" not in lowered
+
+    def test_written_agent_matches_the_config(self, tmp_path: Path):
+        name, path = write_agent("You are Claude.", tmp_path)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert config == build_agent_config(name, "You are Claude.")
+        assert "kiro" not in name.lower()
+        assert "gateway" not in name.lower()

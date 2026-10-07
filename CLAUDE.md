@@ -137,6 +137,9 @@ Rules:
 | `kiro/routes_acp.py` | `/acp/chat`, `/acp/chat/stream` |
 | `kiro/config.py` | Env-driven settings (`settings` object + module constants) |
 | `kiro/compliance.py` | Single-account enforcement at startup |
+| `kiro/system_prompt_agent.py` | Deliver the harness system prompt via a kiro-cli agent `prompt` (ephemeral `sysctx-*` agent, plus the identity guard) |
+| `kiro/system_sanitizer.py` | Strip instruction-override lines from system prompts; channel-dependent identity handling |
+| `kiro/identity_scrub.py` | Rewrite runtime branding out of model output, streaming deltas, and error text |
 | `kiro/capability_executor.py` | Stub capability dispatch (retained; not in the live permission path) |
 
 ---
@@ -156,6 +159,10 @@ existing env vars take precedence over `.env`).
 | `ACP_ENABLED` / `OPENAI_SHIM_ENABLED` / `ANTHROPIC_SHIM_ENABLED` | `true` | Router toggles |
 | `SERVER_HOST` / `SERVER_PORT` | `0.0.0.0` / `8000` | Bind address |
 | `COMPLIANCE_MODE` | `true` | Single-account enforcement |
+| `SCRUB_RUNTIME_IDENTITY` | `true` | Rewrite runtime branding out of replies and error text (`kiro/identity_scrub.py`) |
+| `MODEL_OWNED_BY` | `anthropic` | `owned_by` value on OpenAI-style model listings |
+| `SANITIZE_SYSTEM_PROMPTS` | `true` | Strip instruction-override lines from system prompts (issue #73) |
+| `KIRO_SYSTEM_PROMPT` | `agent` | Where the harness system prompt lands: `agent` (kiro-cli agent prompt) or `inline` (`System:` label) |
 
 > **Security note:** `ACP_TRUST_TOOLS=true` lets `kiro-cli` run built-in tools
 > (including file writes and command execution) in the session `cwd` without

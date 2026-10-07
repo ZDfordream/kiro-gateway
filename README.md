@@ -529,7 +529,7 @@ harness prompt lands, not how many tokens it costs.
 - The label is also used when `KIRO_ACP_MODE` or `KIRO_ACP_AGENT` selects a
   persona (its agent config is kept) and as an automatic fallback if the agent
   cannot be written or selected.
-- Agents live in `~/.kiro/agents` as `kiro-gateway-sys-*.json` for the moment
+- Agents live in `~/.kiro/agents` as `sysctx-*.json` for the moment
   between `session/new` and `session/set_mode`. Files left by a crash are
   removed at startup.
 - Cost: selecting an agent re-initialises kiro-cli's global MCP servers, which

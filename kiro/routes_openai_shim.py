@@ -45,7 +45,10 @@ from kiro.multimodal import (
 )
 from kiro.shim_service import ShimService
 from kiro.streaming_core import KEEPALIVE, iter_with_keepalive
-from kiro.system_sanitizer import sanitize_system_prompt
+from kiro.system_sanitizer import (
+    agent_system_prompt_channel,
+    sanitize_system_prompt,
+)
 from kiro.tokenizer import normalize_usage
 
 router = APIRouter(prefix="/v1", tags=["OpenAI Shim"])
@@ -174,11 +177,15 @@ def _oai_messages_to_acp(messages: list[OAIMessage]) -> list[PromptMessage]:
         else:
             content = m.content or ""
 
-        # Strip identity-override / concealment patterns from system messages
-        # so kiro-cli's model doesn't flag them as prompt injection (issue #73).
+        # Strip instruction-override patterns from system messages so kiro-cli's
+        # model doesn't flag them as prompt injection (issue #73). Identity and
+        # concealment lines survive when the prompt uses the agent channel,
+        # where they are legitimate system-prompt content.
         if acp_role in ("system", "developer") and settings.SANITIZE_SYSTEM_PROMPTS:
             if isinstance(content, str):
-                content = sanitize_system_prompt(content) or ""
+                content = sanitize_system_prompt(
+                    content, preserve_identity=agent_system_prompt_channel(settings)
+                ) or ""
 
         # tool role: wrap with tool_call_id context
         if m.role == "tool" and m.tool_call_id:
@@ -348,14 +355,14 @@ async def list_models(shim: ShimService = Depends(_get_shim)):
     live = shim.available_models()
     model_ids = [_normalise_model_id(m["id"]) for m in live] if live else [_normalise_model_id(m) for m in DEFAULT_KIRO_MODELS]
     models = [
-        {"id": model_id, "object": "model", "owned_by": "kiro"}
+        {"id": model_id, "object": "model", "owned_by": settings.MODEL_OWNED_BY}
         for model_id in model_ids
     ]
     # Claude Code's gateway discovery filter only accepts ^(claude|anthropic) ids.
     # Inject claude-auto alongside auto so it appears in Claude Code's /model picker
     # while other harnesses keep the plain auto entry.
     if "auto" in model_ids:
-        models.append({"id": "claude-auto", "object": "model", "owned_by": "kiro"})
+        models.append({"id": "claude-auto", "object": "model", "owned_by": settings.MODEL_OWNED_BY})
     return {"object": "list", "data": models}
 
 
@@ -382,7 +389,7 @@ async def retrieve_model(model_id: str, shim: ShimService = Depends(_get_shim)):
         "id": model_id,
         "object": "model",
         "created": int(time.time()),
-        "owned_by": "kiro",
+        "owned_by": settings.MODEL_OWNED_BY,
     }
 
 
@@ -1002,8 +1009,10 @@ def _responses_item_to_acp(item: Any) -> list[PromptMessage]:
         content = _responses_content_to_acp(item.get("content"))
         if role in ("system", "developer") and isinstance(content, str) \
                 and settings.SANITIZE_SYSTEM_PROMPTS:
-            # Same identity/concealment filter as the other shims (issue #73).
-            content = sanitize_system_prompt(content) or ""
+            # Same filter as the other shims (issue #73), channel-dependent.
+            content = sanitize_system_prompt(
+                content, preserve_identity=agent_system_prompt_channel(settings)
+            ) or ""
         if _is_empty_content(content):
             return []
         return [PromptMessage(role=role, content=content)]
@@ -1065,7 +1074,9 @@ def _responses_input_to_acp(
         # like every other system prompt (issue #73).
         system_text = str(instructions)
         if settings.SANITIZE_SYSTEM_PROMPTS:
-            system_text = sanitize_system_prompt(system_text) or ""
+            system_text = sanitize_system_prompt(
+                system_text, preserve_identity=agent_system_prompt_channel(settings)
+            ) or ""
         if system_text:
             messages.append(PromptMessage(role="system", content=system_text))
 

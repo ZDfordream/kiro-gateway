@@ -53,7 +53,10 @@ from kiro.model_validation import ModelNotAvailableError, resolve_alias, validat
 from kiro.multimodal import anthropic_block_to_blocks, collapse_blocks
 from kiro.shim_service import ShimService
 from kiro.streaming_core import KEEPALIVE, iter_with_keepalive
-from kiro.system_sanitizer import sanitize_system_prompt
+from kiro.system_sanitizer import (
+    agent_system_prompt_channel,
+    sanitize_system_prompt,
+)
 from kiro.tokenizer import estimate_request_tokens, normalize_usage
 
 router = APIRouter(tags=["Anthropic Shim"])
@@ -282,10 +285,14 @@ def _anthropic_messages_to_acp(
     result = []
     system_text = _system_to_text(system)
     if system_text:
-        # Strip identity-override / concealment patterns so kiro-cli's model
-        # doesn't flag harness metadata as prompt injection (issue #73).
+        # Strip instruction-override patterns so kiro-cli's model doesn't flag
+        # harness metadata as prompt injection (issue #73). Identity and
+        # concealment lines survive on the agent channel, where they are
+        # legitimate system-prompt content.
         if settings.SANITIZE_SYSTEM_PROMPTS:
-            system_text = sanitize_system_prompt(system_text) or ""
+            system_text = sanitize_system_prompt(
+                system_text, preserve_identity=agent_system_prompt_channel(settings)
+            ) or ""
         # Preserve the system prompt as a distinct system role. ACP has no
         # dedicated system channel, so the prompt serialiser renders it with a
         # ``System:`` label — faithful to its provenance, instead of the older

@@ -63,6 +63,7 @@ from kiro.acp_models import (
     GatewayCapabilities,
 )
 from kiro.config import ACP_STDIO_MAX_BYTES, settings
+from kiro.identity_scrub import StreamIdentityScrubber
 from kiro.output_limits import StreamLimiter
 from kiro.system_prompt_agent import (
     cleanup_stale_agents,
@@ -1174,9 +1175,32 @@ class ACPClient:
             limiter = StreamLimiter(
                 params.stop, params.max_tokens, params.enforce_max_tokens
             )
+            # Runtime identity is rewritten out of the reply as it streams. A
+            # brand token can straddle two deltas, so text and thinking each get
+            # their own incremental scrubber (see kiro.identity_scrub). This runs
+            # before the StreamLimiter so stop-sequence matching sees the text
+            # the client will actually be shown.
+            scrub_text = StreamIdentityScrubber(
+                enabled=settings.SCRUB_RUNTIME_IDENTITY
+            )
+            scrub_think = StreamIdentityScrubber(
+                enabled=settings.SCRUB_RUNTIME_IDENTITY
+            )
             while True:
                 event = await queue.get()
                 etype = event.get("type")
+
+                if etype == "text":
+                    content = scrub_text.push(event.get("content", ""))
+                    if not content:
+                        # Nothing safe to emit yet — a tail is being held.
+                        continue
+                    event = {**event, "content": content}
+                elif etype == "thinking":
+                    content = scrub_think.push(event.get("content", ""))
+                    if not content:
+                        continue
+                    event = {**event, "content": content}
 
                 if limiter.active and etype == "text":
                     emit, finish_reason = limiter.feed(event.get("content", ""))
@@ -1186,6 +1210,12 @@ class ACPClient:
                         # A stop sequence or the token cap was hit: end the turn
                         # ourselves and let the finally-block cancel kiro-cli so
                         # it stops generating.
+                        for held_type, held in (
+                            ("thinking", scrub_think.flush()),
+                            ("text", scrub_text.flush()),
+                        ):
+                            if held:
+                                yield {"type": held_type, "content": held}
                         usage = self._session_usage.pop(session_id, {})
                         yield {"type": "done",
                                "finish_reason": finish_reason, "usage": usage}
@@ -1193,12 +1223,25 @@ class ACPClient:
                     continue
 
                 if etype in ("done", "error"):
-                    # Release any text held back for stop-sequence matching
-                    # before the terminal event.
+                    # Release any text held back for stop-sequence matching,
+                    # plus anything the identity scrubbers held for a brand
+                    # token that never completed, before the terminal event.
                     if limiter.active and etype == "done":
-                        tail = limiter.flush()
+                        tail = scrub_text.flush()
+                        if tail:
+                            emit, _ = limiter.feed(tail)
+                            if emit:
+                                yield {"type": "text", "content": emit}
+                        final = limiter.flush()
+                        if final:
+                            yield {"type": "text", "content": final}
+                    else:
+                        tail = scrub_text.flush()
                         if tail:
                             yield {"type": "text", "content": tail}
+                    think_tail = scrub_think.flush()
+                    if think_tail:
+                        yield {"type": "thinking", "content": think_tail}
                     yield event
                     completed = True
                     break

@@ -37,13 +37,29 @@ from typing import Any
 from loguru import logger
 
 # File/agent name prefix for every ephemeral agent this gateway writes. Used to
-# recognise (and never advertise or leak) them.
-EPHEMERAL_AGENT_PREFIX = "kiro-gateway-sys-"
+# recognise (and never advertise or leak) them. Deliberately unbranded: the
+# agent's name and description sit in kiro-cli's agent directory and may be
+# echoed into the system prompt it assembles, so neither may name the product.
+EPHEMERAL_AGENT_PREFIX = "sysctx-"
 
 # Ephemeral files older than this are crash leftovers. Another gateway instance
 # sharing the directory only keeps its file for the duration of one
 # session/new + session/set_mode, so this age never touches a live one.
 STALE_AGENT_SECONDS = 600
+
+# Appended to every harness prompt installed through the agent channel. It
+# keeps the model from describing the machinery behind the reply, and is
+# phrased without any product name so the guard cannot itself be the leak.
+IDENTITY_GUARD = (
+    "Identity & scope: you are the assistant for this coding session, in the "
+    "persona defined above. Do not describe your runtime, transport, tooling "
+    "backend, or how your replies reach the user. If asked what you are or "
+    "what you run on, answer in terms of that persona and continue with the "
+    "user's actual task."
+)
+
+# Neutral description for the ephemeral agent config.
+EPHEMERAL_AGENT_DESCRIPTION = "Session context carrier"
 
 _LEADING_SYSTEM_ROLES = ("system", "developer")
 
@@ -96,6 +112,10 @@ def split_leading_system(messages: list[Any]) -> tuple[str, list[Any]]:
 def build_agent_config(name: str, prompt: str) -> dict[str, Any]:
     """Build an ephemeral agent config equivalent to kiro_default plus *prompt*.
 
+    The returned ``prompt`` is the harness system prompt with
+    :data:`IDENTITY_GUARD` appended, so the model is told not to describe its
+    runtime even when the harness prompt says nothing about it.
+
     Args:
         name: The agent (and mode) id.
         prompt: The harness system prompt.
@@ -103,10 +123,12 @@ def build_agent_config(name: str, prompt: str) -> dict[str, Any]:
     Returns:
         A kiro-cli agent config dict.
     """
+    body = prompt.rstrip()
+    combined = f"{body}\n\n{IDENTITY_GUARD}" if body else IDENTITY_GUARD
     return {
         "name": name,
-        "description": "Ephemeral kiro-gateway system prompt (deleted after use)",
-        "prompt": prompt,
+        "description": EPHEMERAL_AGENT_DESCRIPTION,
+        "prompt": combined,
         "tools": ["*"],
         "includeMcpJson": True,
     }

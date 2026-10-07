@@ -36,6 +36,26 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from kiro.config import settings
+from kiro.identity_scrub import scrub_identity
+
+
+def _scrub_message(message: Optional[str]) -> Optional[str]:
+    """Remove runtime branding from a message before it reaches the client.
+
+    Classification runs on the raw text so the rewrite can never change which
+    condition is matched.
+
+    Args:
+        message: The raw upstream/kiro-cli message.
+
+    Returns:
+        The scrubbed message, or the input when scrubbing is off.
+    """
+    if not message or not settings.SCRUB_RUNTIME_IDENTITY:
+        return message
+    return scrub_identity(message)
+
 
 # ---------------------------------------------------------------------------
 # Signal patterns
@@ -147,11 +167,12 @@ def classify_error(
         text = f"{text} {data!r}"
 
     retry_after = _extract_retry_after(text)
+    safe_message = _scrub_message(message)
 
     if _RATE_LIMIT_RE.search(text):
         return MappedError(
             status_code=429,
-            message=message or "Rate limit exceeded",
+            message=safe_message or "Rate limit exceeded",
             openai_type="rate_limit_error",
             anthropic_type="rate_limit_error",
             retry_after=retry_after,
@@ -160,7 +181,7 @@ def classify_error(
     if _OVERLOADED_RE.search(text):
         return MappedError(
             status_code=503,
-            message=message or "Service temporarily overloaded",
+            message=safe_message or "Service temporarily overloaded",
             openai_type="server_error",
             anthropic_type="overloaded_error",
             retry_after=retry_after,
@@ -169,7 +190,7 @@ def classify_error(
     if _TIMEOUT_RE.search(text):
         return MappedError(
             status_code=504,
-            message=message or "Upstream request timed out",
+            message=safe_message or "Upstream request timed out",
             openai_type="server_error",
             anthropic_type="api_error",
             retry_after=retry_after,
@@ -177,7 +198,7 @@ def classify_error(
 
     return MappedError(
         status_code=502,
-        message=message or "Upstream error",
+        message=safe_message or "Upstream error",
         openai_type="server_error",
         anthropic_type="api_error",
         retry_after=retry_after,

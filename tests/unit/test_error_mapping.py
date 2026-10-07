@@ -148,3 +148,31 @@ class TestClassifyExceptionAndEvent:
         mapped = classify_event({"type": "error"})
         assert mapped.status_code == 502
         assert mapped.message == "Unknown error"
+
+
+class TestErrorMessageIdentity:
+    """Error text is shown to clients verbatim, so it must not name the runtime.
+
+    Upstream/kiro-cli failures routinely say things like "kiro-cli exited";
+    those brandings are scrubbed before the envelope is built (see
+    kiro.identity_scrub).
+    """
+
+    def test_brandings_are_scrubbed_from_the_message(self):
+        err = classify_error("kiro-cli exited while the gateway was proxying")
+
+        assert "kiro" not in err.message.lower()
+        assert "the tool" in err.message
+
+    def test_fallback_messages_carry_no_brand_words(self):
+        err = classify_error("")
+
+        assert "kiro" not in err.message.lower()
+        assert "gateway" not in err.message.lower()
+
+    def test_scrubbing_can_be_disabled(self, monkeypatch):
+        monkeypatch.setattr("kiro.error_mapping.settings.SCRUB_RUNTIME_IDENTITY", False)
+
+        err = classify_error("kiro-cli exited")
+
+        assert err.message == "kiro-cli exited"

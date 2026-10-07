@@ -220,6 +220,20 @@ SANITIZE_SYSTEM_PROMPTS: bool = (
     os.environ.get("SANITIZE_SYSTEM_PROMPTS", "true").lower() != "false"
 )
 
+# Rewrite runtime identity out of model output and passthrough error text.
+# kiro-cli's own system prompt names the product, so replies drift into
+# "kiro-cli"/"Kiro Gateway" — including when the user never asked. This scrubs
+# those brandings out of everything the client is shown (see
+# kiro.identity_scrub). Set false to forward model output verbatim.
+SCRUB_RUNTIME_IDENTITY: bool = (
+    os.environ.get("SCRUB_RUNTIME_IDENTITY", "true").lower() != "false"
+)
+
+# Value reported as ``owned_by`` on OpenAI-style model listings. Defaults to a
+# neutral vendor name so the listing does not name the runtime either; override
+# if a harness expects a specific value.
+MODEL_OWNED_BY: str = os.environ.get("MODEL_OWNED_BY", "anthropic").strip() or "anthropic"
+
 # MCP servers registered on every ACP session via ``session/new``'s
 # ``mcpServers`` field. This is the ONLY external-tool channel kiro-cli honors
 # over ACP: it advertises ``mcpCapabilities.http: true`` and executes the MCP
@@ -582,6 +596,10 @@ class _Settings:
     ACP_SURFACE_TOOL_CALLS: bool = field(default_factory=lambda: ACP_SURFACE_TOOL_CALLS)
     ACP_SURFACE_THINKING: bool = field(default_factory=lambda: ACP_SURFACE_THINKING)
     SANITIZE_SYSTEM_PROMPTS: bool = field(default_factory=lambda: SANITIZE_SYSTEM_PROMPTS)
+    SCRUB_RUNTIME_IDENTITY: bool = field(
+        default_factory=lambda: SCRUB_RUNTIME_IDENTITY
+    )
+    MODEL_OWNED_BY: str = field(default_factory=lambda: MODEL_OWNED_BY)
     MCP_SERVERS: List[dict] = field(default_factory=lambda: [dict(s) for s in MCP_SERVERS])
     MCP_INIT_TIMEOUT: int = field(default_factory=lambda: MCP_INIT_TIMEOUT)
     MCP_DISCOVERY: str = field(default_factory=lambda: MCP_DISCOVERY)

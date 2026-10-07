@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 
+
 class TextContent(BaseModel):
     type: Literal["text"] = "text"
     text: str
@@ -152,7 +153,11 @@ class ModelData(BaseModel):
     id: str
     object: str = "model"
     created: int = 0
-    owned_by: str = "kiro"
+    # Unbranded so the runtime is not named. Keep this a plain default — the
+    # module must not import kiro.config, or it drags config into the import
+    # graph early enough to race test_acp_client's importlib.reload of it.
+    # The live /v1/models routes build dicts with kiro.config.MODEL_OWNED_BY.
+    owned_by: str = "anthropic"
 
 
 class ModelList(BaseModel):

@@ -31,7 +31,7 @@ class KiroContextLengthError(KiroError):
 
 
 class KiroServerError(KiroError):
-    def __init__(self, message: str = "Kiro server error") -> None:
+    def __init__(self, message: str = "Upstream server error") -> None:
         super().__init__(message, status_code=500)
 
 
